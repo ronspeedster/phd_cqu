@@ -1,0 +1,12 @@
+arg_name,arg_value
+fasta,example.fasta
+mutationfrom,G
+mutationto,A
+upstreamcontext,
+downstreamcontext,RD
+prefix,example-strict-
+enforce,D
+match,strict
+keepgaps,False
+begin,0
+finish,None

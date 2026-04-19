@@ -1,0 +1,6 @@
+seq_name,primary_matches,potential_primaries,control_matches,potential_controls,rate_ratio,fisher_p
+Seq2,0.0,71.0,0.0,54.0,undef,1
+Seq5,4.0,69.0,1.0,52.0,3.01,0.282669
+Seq7,26.0,71.0,1.0,54.0,19.77,5.35061e-07
+Seq14,48.0,71.0,9.0,54.0,4.06,8.26961e-09
+resolved_consensus,29.25,71.0,5.25,54.0,4.24,5.38568e-05
