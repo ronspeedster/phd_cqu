@@ -27,7 +27,7 @@ FIELD_SEPARATOR = ","
 MISSING_VALUES = {"", "-", "NA", "N/A", "na", "n/a", "null", "None"}
 
 # Requested input
-fasta_path = Path("data/hiv-db-complete-genome-problematic-nucleutides.fasta")
+fasta_path = Path("data/hiv-db-any-unaligned.fasta")
 print(f"Configured input file: {fasta_path}")
 
 

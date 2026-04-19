@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import argparse
 import csv
@@ -359,6 +360,44 @@ def write_csv(rows: list[dict[str, str]], out_file: Path) -> None:
     LOGGER.info("Wrote %d rows: %s", len(rows), out_file)
 
 
+def append_row_to_csv(row: dict[str, str], out_file: Path, fieldnames: list[str] | None = None) -> None:
+    """Append a single row to a CSV file. Create file with headers if it doesn't exist."""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = out_file.exists()
+
+    if fieldnames is None:
+        fieldnames = list(row.keys())
+
+    with out_file.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def initialize_csv_file(out_file: Path, fieldnames: list[str]) -> None:
+    """Create or reset a CSV file with its header row."""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def create_csv_backup(source: Path, backup: Path) -> None:
+    """Create a backup copy of a CSV file. If source doesn't exist, create empty backup."""
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if source.exists():
+        shutil.copy2(source, backup)
+        LOGGER.info("Created backup: %s", backup)
+    else:
+        backup.touch()
+        LOGGER.info("Created empty backup (source does not exist): %s", backup)
+
+
 # %% Cell 5 - Pairwise Hypermut3 pipeline
 def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     LOGGER.info("Pairwise Hypermut3 pipeline started")
@@ -377,6 +416,12 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     per_seq_dir = cfg.output_dir / "per_sequence_hypermut"
     for path in [pair_input_dir, pair_aligned_dir, per_seq_dir]:
         path.mkdir(parents=True, exist_ok=True)
+
+    merged_csv = cfg.output_dir / "per_sequence_hypermut_merged.csv"
+    live_progress_csv = (
+        cfg.output_dir / "per_sequence_hypermut_merged_for_initial_showing.csv"
+    )
+    create_csv_backup(merged_csv, live_progress_csv)
 
     seq_to_group = load_sequence_to_group_map(cfg.sequence_to_group_csv)
     group_consensus: dict[str, tuple[str, str]] = {}
@@ -429,6 +474,28 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
 
     rows_merged: list[dict[str, str]] = []
     rows_failures: list[dict[str, str]] = []
+
+    merged_csv_fieldnames = [
+        "seq_header",
+        "final_group_key",
+        "consensus_header",
+        "pair_aligned_fasta",
+        "run_name",
+        "match",
+        "keepgaps",
+        "mutation_from",
+        "mutation_to",
+        "seq_name",
+        "primary_matches",
+        "potential_primaries",
+        "control_matches",
+        "potential_controls",
+        "rate_ratio",
+        "fisher_p",
+        "summary_csv",
+        "positions_csv",
+    ]
+    initialize_csv_file(live_progress_csv, merged_csv_fieldnames)
 
     total = len(sequence_records)
     if cfg.reuse_existing_pairwise_alignments:
@@ -493,28 +560,32 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                         sum_row = read_single_hypermut_summary(
                             Path(run_info["summary_csv"])
                         )
-                        rows_merged.append(
-                            {
-                                "seq_header": seq_header,
-                                "final_group_key": final_key,
-                                "consensus_header": consensus_header,
-                                "pair_aligned_fasta": str(pair_aligned),
-                                "run_name": run_info["run_name"],
-                                "match": run_info["match"],
-                                "keepgaps": run_info["keepgaps"],
-                                "mutation_from": run_info["mutation_from"],
-                                "mutation_to": run_info["mutation_to"],
-                                "seq_name": sum_row["seq_name"],
-                                "primary_matches": sum_row["primary_matches"],
-                                "potential_primaries": sum_row["potential_primaries"],
-                                "control_matches": sum_row["control_matches"],
-                                "potential_controls": sum_row["potential_controls"],
-                                "rate_ratio": sum_row["rate_ratio"],
-                                "fisher_p": sum_row["fisher_p"],
-                                "summary_csv": run_info["summary_csv"],
-                                "positions_csv": run_info["positions_csv"],
-                            }
+                        row_data = {
+                            "seq_header": seq_header,
+                            "final_group_key": final_key,
+                            "consensus_header": consensus_header,
+                            "pair_aligned_fasta": str(pair_aligned),
+                            "run_name": run_info["run_name"],
+                            "match": run_info["match"],
+                            "keepgaps": run_info["keepgaps"],
+                            "mutation_from": run_info["mutation_from"],
+                            "mutation_to": run_info["mutation_to"],
+                            "seq_name": sum_row["seq_name"],
+                            "primary_matches": sum_row["primary_matches"],
+                            "potential_primaries": sum_row["potential_primaries"],
+                            "control_matches": sum_row["control_matches"],
+                            "potential_controls": sum_row["potential_controls"],
+                            "rate_ratio": sum_row["rate_ratio"],
+                            "fisher_p": sum_row["fisher_p"],
+                            "summary_csv": run_info["summary_csv"],
+                            "positions_csv": run_info["positions_csv"],
+                        }
+                        append_row_to_csv(
+                            row_data,
+                            live_progress_csv,
+                            merged_csv_fieldnames,
                         )
+                        rows_merged.append(row_data)
             except Exception as exc:
                 LOGGER.exception("Failed sequence: %s", seq_header)
                 rows_failures.append(
@@ -586,28 +657,32 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                         sum_row = read_single_hypermut_summary(
                             Path(run_info["summary_csv"])
                         )
-                        rows_merged.append(
-                            {
-                                "seq_header": seq_header,
-                                "final_group_key": final_key,
-                                "consensus_header": consensus_header,
-                                "pair_aligned_fasta": str(pair_aligned),
-                                "run_name": run_info["run_name"],
-                                "match": run_info["match"],
-                                "keepgaps": run_info["keepgaps"],
-                                "mutation_from": run_info["mutation_from"],
-                                "mutation_to": run_info["mutation_to"],
-                                "seq_name": sum_row["seq_name"],
-                                "primary_matches": sum_row["primary_matches"],
-                                "potential_primaries": sum_row["potential_primaries"],
-                                "control_matches": sum_row["control_matches"],
-                                "potential_controls": sum_row["potential_controls"],
-                                "rate_ratio": sum_row["rate_ratio"],
-                                "fisher_p": sum_row["fisher_p"],
-                                "summary_csv": run_info["summary_csv"],
-                                "positions_csv": run_info["positions_csv"],
-                            }
+                        row_data = {
+                            "seq_header": seq_header,
+                            "final_group_key": final_key,
+                            "consensus_header": consensus_header,
+                            "pair_aligned_fasta": str(pair_aligned),
+                            "run_name": run_info["run_name"],
+                            "match": run_info["match"],
+                            "keepgaps": run_info["keepgaps"],
+                            "mutation_from": run_info["mutation_from"],
+                            "mutation_to": run_info["mutation_to"],
+                            "seq_name": sum_row["seq_name"],
+                            "primary_matches": sum_row["primary_matches"],
+                            "potential_primaries": sum_row["potential_primaries"],
+                            "control_matches": sum_row["control_matches"],
+                            "potential_controls": sum_row["potential_controls"],
+                            "rate_ratio": sum_row["rate_ratio"],
+                            "fisher_p": sum_row["fisher_p"],
+                            "summary_csv": run_info["summary_csv"],
+                            "positions_csv": run_info["positions_csv"],
+                        }
+                        append_row_to_csv(
+                            row_data,
+                            live_progress_csv,
+                            merged_csv_fieldnames,
                         )
+                        rows_merged.append(row_data)
 
             except Exception as exc:
                 LOGGER.exception("Failed sequence: %s", seq_header)
@@ -619,9 +694,15 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     }
                 )
 
-    merged_csv = cfg.output_dir / "per_sequence_hypermut_merged.csv"
+    try:
+        write_csv(rows_merged, merged_csv)
+    except PermissionError:
+        LOGGER.warning(
+            "Could not write final merged CSV because it is open: %s",
+            merged_csv,
+        )
+
     failed_csv = cfg.output_dir / "per_sequence_hypermut_failures.csv"
-    write_csv(rows_merged, merged_csv)
     write_csv(rows_failures, failed_csv)
 
     LOGGER.info("Pairwise Hypermut3 pipeline finished")
@@ -633,6 +714,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
         "sequence_to_group_csv": str(cfg.sequence_to_group_csv),
         "output_dir": str(cfg.output_dir),
         "merged_csv": str(merged_csv),
+        "live_progress_csv": str(live_progress_csv),
         "failures_csv": str(failed_csv),
         "n_sequences": total,
         "n_success_rows": len(rows_merged),
