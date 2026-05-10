@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 import argparse
@@ -44,6 +45,7 @@ class PipelineConfig:
     number_of_sequence: int | None = None
     run_all_mutation_directions: bool = False
     reuse_existing_pairwise_alignments: bool = False
+    parallel_workers: int | None = None
     log_level: str = "INFO"
 
 
@@ -121,6 +123,39 @@ def sanitize_file_component(text: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
     safe = safe.strip("_")
     return safe[:90] if safe else "seq"
+
+
+def resolve_manifest_path(path_text: str, group_manifest_csv: Path) -> Path:
+    """Resolve FASTA paths from manifest across Windows/macOS environments."""
+    text = (path_text or "").strip()
+    if not text:
+        return Path("")
+
+    # Normalize slashes first so we can parse path segments consistently.
+    normalized = text.replace("\\", "/")
+
+    # 1) Direct path as written in manifest.
+    direct = Path(normalized)
+    if direct.exists():
+        return direct
+
+    # 2) Relative to project root (script lives in project root).
+    project_root = group_manifest_csv.resolve().parents[2]
+    relative_candidate = project_root / normalized
+    if relative_candidate.exists():
+        return relative_candidate
+
+    # 3) Convert absolute Windows paths containing /data/... to local project path.
+    lower = normalized.lower()
+    marker = "/data/"
+    idx = lower.find(marker)
+    if idx != -1:
+        data_tail = normalized[idx + len(marker):]
+        data_candidate = project_root / "data" / data_tail
+        if data_candidate.exists():
+            return data_candidate
+
+    return direct
 
 
 # %% Cell 3 - Pairwise alignment and Hypermut execution
@@ -305,7 +340,10 @@ def load_group_consensus_map(group_manifest_csv: Path) -> dict[str, tuple[str, s
             cluster_id = row.get("cluster_id", "").strip()
             bin_id = row.get("bin_id", "").strip()
             reduced_key = f"SamplingYear={sampling_year}|HXB2Start={hxb2_start}"
-            consensus_fasta = Path(row.get("consensus_fasta", "").strip())
+            consensus_fasta = resolve_manifest_path(
+                row.get("consensus_fasta", ""),
+                group_manifest_csv,
+            )
             if not consensus_fasta.exists():
                 continue
             records = read_fasta_records(consensus_fasta)
@@ -398,6 +436,165 @@ def create_csv_backup(source: Path, backup: Path) -> None:
         LOGGER.info("Created empty backup (source does not exist): %s", backup)
 
 
+def build_merged_row(
+    *,
+    seq_header: str,
+    final_key: str,
+    consensus_header: str,
+    pair_aligned: Path,
+    run_info: dict[str, str],
+    sum_row: dict[str, str],
+) -> dict[str, str]:
+    return {
+        "seq_header": seq_header,
+        "final_group_key": final_key,
+        "consensus_header": consensus_header,
+        "pair_aligned_fasta": str(pair_aligned),
+        "run_name": run_info["run_name"],
+        "match": run_info["match"],
+        "keepgaps": run_info["keepgaps"],
+        "mutation_from": run_info["mutation_from"],
+        "mutation_to": run_info["mutation_to"],
+        "seq_name": sum_row["seq_name"],
+        "primary_matches": sum_row["primary_matches"],
+        "potential_primaries": sum_row["potential_primaries"],
+        "control_matches": sum_row["control_matches"],
+        "potential_controls": sum_row["potential_controls"],
+        "rate_ratio": sum_row["rate_ratio"],
+        "fisher_p": sum_row["fisher_p"],
+        "summary_csv": run_info["summary_csv"],
+        "positions_csv": run_info["positions_csv"],
+    }
+
+
+def process_existing_pair_task(
+    *,
+    cfg: PipelineConfig,
+    pair_aligned: Path,
+    seq_to_group: dict[str, str],
+    mutation_directions: list[tuple[str, str]],
+    run_modes: list[HypermutRunConfig],
+    per_seq_dir: Path,
+) -> tuple[list[dict[str, str]], dict[str, str] | None]:
+    rows: list[dict[str, str]] = []
+    pair_records = read_fasta_records(pair_aligned)
+    if len(pair_records) < 2:
+        return rows, {
+            "seq_header": pair_aligned.name,
+            "final_group_key": "",
+            "error": "Aligned pair FASTA has fewer than 2 records",
+        }
+
+    consensus_header = pair_records[0][0]
+    seq_header = pair_records[1][0]
+    LOGGER.info("Processing sequence (reuse mode): %s", seq_header)
+    final_key = seq_to_group.get(seq_header, "")
+    seq_slug = pair_aligned.name.replace("_aligned.fasta", "")
+    seq_run_dir = per_seq_dir / seq_slug
+    seq_run_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for mutation_from, mutation_to in mutation_directions:
+            direction_tag = f"{mutation_from}to{mutation_to}"
+            for mode in run_modes:
+                run_info = run_hypermut_once(
+                    cfg=cfg,
+                    run_cfg=mode,
+                    aligned_pair_fasta=pair_aligned,
+                    seq_output_dir=seq_run_dir,
+                    mutation_from=mutation_from,
+                    mutation_to=mutation_to,
+                    direction_tag=direction_tag,
+                )
+                sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
+                rows.append(
+                    build_merged_row(
+                        seq_header=seq_header,
+                        final_key=final_key,
+                        consensus_header=consensus_header,
+                        pair_aligned=pair_aligned,
+                        run_info=run_info,
+                        sum_row=sum_row,
+                    )
+                )
+    except Exception as exc:
+        return [], {
+            "seq_header": seq_header,
+            "final_group_key": final_key,
+            "error": str(exc),
+        }
+
+    return rows, None
+
+
+def process_sequence_task(
+    *,
+    cfg: PipelineConfig,
+    idx: int,
+    seq_header: str,
+    final_key: str,
+    seq_body: str,
+    consensus_header: str,
+    consensus_seq: str,
+    mutation_directions: list[tuple[str, str]],
+    run_modes: list[HypermutRunConfig],
+    pair_input_dir: Path,
+    pair_aligned_dir: Path,
+    per_seq_dir: Path,
+) -> tuple[list[dict[str, str]], dict[str, str] | None]:
+    rows: list[dict[str, str]] = []
+    seq_slug = f"{idx:04d}_{sanitize_file_component(seq_header)}"
+    LOGGER.info("Processing sequence %d: %s", idx, seq_header)
+    pair_input = pair_input_dir / f"{seq_slug}.fasta"
+    pair_aligned = pair_aligned_dir / f"{seq_slug}_aligned.fasta"
+    seq_run_dir = per_seq_dir / seq_slug
+    seq_run_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        aligned_pair = align_pair_with_mafft(
+            consensus_header=consensus_header,
+            consensus_seq=consensus_seq,
+            query_header=seq_header,
+            query_seq=seq_body,
+            cfg=cfg,
+            pair_input_path=pair_input,
+            pair_aligned_path=pair_aligned,
+        )
+        write_fasta_records(aligned_pair, pair_aligned)
+
+        for mutation_from, mutation_to in mutation_directions:
+            direction_tag = f"{mutation_from}to{mutation_to}"
+            for mode in run_modes:
+                run_info = run_hypermut_once(
+                    cfg=cfg,
+                    run_cfg=mode,
+                    aligned_pair_fasta=pair_aligned,
+                    seq_output_dir=seq_run_dir,
+                    mutation_from=mutation_from,
+                    mutation_to=mutation_to,
+                    direction_tag=direction_tag,
+                )
+                sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
+                rows.append(
+                    build_merged_row(
+                        seq_header=seq_header,
+                        final_key=final_key,
+                        consensus_header=consensus_header,
+                        pair_aligned=pair_aligned,
+                        run_info=run_info,
+                        sum_row=sum_row,
+                    )
+                )
+    except Exception as exc:
+        return [], {
+            "seq_header": seq_header,
+            "final_group_key": final_key,
+            "error": str(exc),
+        }
+
+    return rows, None
+
+
 # %% Cell 5 - Pairwise Hypermut3 pipeline
 def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     LOGGER.info("Pairwise Hypermut3 pipeline started")
@@ -449,6 +646,17 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     if cfg.run_all_mutation_directions:
         LOGGER.info("All-direction mode enabled (12 directions expected)")
 
+    workers = cfg.parallel_workers or max(1, (os.cpu_count() or 1))
+    workers = max(1, workers)
+    if workers > 1 and cfg.mafft_threads == -1 and not cfg.reuse_existing_pairwise_alignments:
+        LOGGER.warning(
+            "parallel_workers=%d with mafft_threads=-1 can oversubscribe CPUs; "
+            "forcing mafft_threads=1 for balanced parallel execution",
+            workers,
+        )
+        cfg.mafft_threads = 1
+    LOGGER.info("Parallel workers: %d", workers)
+
     sequence_records: list[tuple[str, str, str]] = []
     for seq_header, final_key in seq_to_group.items():
         sequence_records.append((seq_header, "", final_key))
@@ -459,18 +667,32 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
             len(sequence_records),
         )
 
-    raw_map: dict[str, str] = {}
+    query_map: dict[str, str] = {}
     if not cfg.reuse_existing_pairwise_alignments:
-        # Reconstruct sequences from group raw FASTA files listed in group manifest.
+        # Reconstruct query sequences from group aligned FASTA files listed
+        # in group manifest. Fallback to raw FASTA if aligned file is missing.
+        # Remove alignment gaps before running pairwise MAFFT.
         with cfg.group_manifest_csv.open("r", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 full_key = row.get("full_key", "").strip()
-                raw_fasta = Path(row.get("raw_fasta", "").strip())
-                if not full_key or not raw_fasta.exists():
+                aligned_fasta = resolve_manifest_path(
+                    row.get("aligned_fasta", ""),
+                    cfg.group_manifest_csv,
+                )
+                raw_fasta = resolve_manifest_path(
+                    row.get("raw_fasta", ""),
+                    cfg.group_manifest_csv,
+                )
+                if not full_key:
                     continue
-                for header, seq in read_fasta_records(raw_fasta):
-                    raw_map[header] = seq
+
+                source_fasta = aligned_fasta if aligned_fasta.exists() else raw_fasta
+                if not source_fasta.exists():
+                    continue
+
+                for header, seq in read_fasta_records(source_fasta):
+                    query_map[header] = seq.replace("-", "")
 
     rows_merged: list[dict[str, str]] = []
     rows_failures: list[dict[str, str]] = []
@@ -495,6 +717,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
         "summary_csv",
         "positions_csv",
     ]
+    initialize_csv_file(merged_csv, merged_csv_fieldnames)
     initialize_csv_file(live_progress_csv, merged_csv_fieldnames)
 
     total = len(sequence_records)
@@ -522,89 +745,56 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
             total,
         )
 
-        for idx, pair_aligned in enumerate(aligned_files, start=1):
-            pair_records = read_fasta_records(pair_aligned)
-            if len(pair_records) < 2:
-                rows_failures.append(
-                    {
-                        "seq_header": pair_aligned.name,
-                        "final_group_key": "",
-                        "error": "Aligned pair FASTA has fewer than 2 records",
-                    }
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    process_existing_pair_task,
+                    cfg=cfg,
+                    pair_aligned=pair_aligned,
+                    seq_to_group=seq_to_group,
+                    mutation_directions=mutation_directions,
+                    run_modes=run_modes,
+                    per_seq_dir=per_seq_dir,
                 )
-                continue
-
-            consensus_header = pair_records[0][0]
-            seq_header = pair_records[1][0]
-            final_key = seq_to_group.get(seq_header, "")
-            seq_slug = pair_aligned.name.replace("_aligned.fasta", "")
-            seq_run_dir = per_seq_dir / seq_slug
-            seq_run_dir.mkdir(parents=True, exist_ok=True)
-
-            # if idx == 1 or idx % 25 == 0 or idx == total:
-            LOGGER.info("Processing sequence %d/%d: %s", idx, total, seq_header)
-
-            try:
-                for mutation_from, mutation_to in mutation_directions:
-                    direction_tag = f"{mutation_from}to{mutation_to}"
-                    for mode in run_modes:
-                        run_info = run_hypermut_once(
-                            cfg=cfg,
-                            run_cfg=mode,
-                            aligned_pair_fasta=pair_aligned,
-                            seq_output_dir=seq_run_dir,
-                            mutation_from=mutation_from,
-                            mutation_to=mutation_to,
-                            direction_tag=direction_tag,
-                        )
-                        sum_row = read_single_hypermut_summary(
-                            Path(run_info["summary_csv"])
-                        )
-                        row_data = {
-                            "seq_header": seq_header,
-                            "final_group_key": final_key,
-                            "consensus_header": consensus_header,
-                            "pair_aligned_fasta": str(pair_aligned),
-                            "run_name": run_info["run_name"],
-                            "match": run_info["match"],
-                            "keepgaps": run_info["keepgaps"],
-                            "mutation_from": run_info["mutation_from"],
-                            "mutation_to": run_info["mutation_to"],
-                            "seq_name": sum_row["seq_name"],
-                            "primary_matches": sum_row["primary_matches"],
-                            "potential_primaries": sum_row["potential_primaries"],
-                            "control_matches": sum_row["control_matches"],
-                            "potential_controls": sum_row["potential_controls"],
-                            "rate_ratio": sum_row["rate_ratio"],
-                            "fisher_p": sum_row["fisher_p"],
-                            "summary_csv": run_info["summary_csv"],
-                            "positions_csv": run_info["positions_csv"],
-                        }
-                        append_row_to_csv(
-                            row_data,
-                            live_progress_csv,
-                            merged_csv_fieldnames,
-                        )
-                        rows_merged.append(row_data)
-            except Exception as exc:
-                LOGGER.exception("Failed sequence: %s", seq_header)
-                rows_failures.append(
-                    {
-                        "seq_header": seq_header,
-                        "final_group_key": final_key,
-                        "error": str(exc),
-                    }
+                for pair_aligned in aligned_files
+            ]
+            for future in as_completed(futures):
+                rows_batch, failure = future.result()
+                completed += 1
+                if failure is not None:
+                    rows_failures.append(failure)
+                    LOGGER.info(
+                        "Completed %d/%d (FAILED): %s | error=%s",
+                        completed,
+                        total,
+                        failure.get("seq_header", ""),
+                        failure.get("error", ""),
+                    )
+                    continue
+                for row_data in rows_batch:
+                    append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
+                    append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
+                rows_merged.extend(rows_batch)
+                seq_name = rows_batch[0]["seq_header"] if rows_batch else ""
+                LOGGER.info(
+                    "Completed %d/%d: %s | runs=%d",
+                    completed,
+                    total,
+                    seq_name,
+                    len(rows_batch),
                 )
 
     else:
+        valid_tasks: list[tuple[int, str, str, str, str, str]] = []
         for idx, (seq_header, _, final_key) in enumerate(sequence_records, start=1):
-            seq_body = raw_map.get(seq_header)
+            seq_body = query_map.get(seq_header)
             if seq_body is None:
                 rows_failures.append(
                     {
                         "seq_header": seq_header,
                         "final_group_key": final_key,
-                        "error": "Sequence not found in raw group FASTA map",
+                        "error": "Sequence not found in aligned/raw group FASTA map",
                     }
                 )
                 continue
@@ -621,86 +811,64 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                 continue
 
             consensus_header, consensus_seq = consensus_entry
-            seq_slug = f"{idx:04d}_{sanitize_file_component(seq_header)}"
-            pair_input = pair_input_dir / f"{seq_slug}.fasta"
-            pair_aligned = pair_aligned_dir / f"{seq_slug}_aligned.fasta"
-            seq_run_dir = per_seq_dir / seq_slug
-            seq_run_dir.mkdir(parents=True, exist_ok=True)
+            valid_tasks.append(
+                (idx, seq_header, final_key, seq_body, consensus_header, consensus_seq)
+            )
 
-            # if idx == 1 or idx % 25 == 0 or idx == total:
-            LOGGER.info("Processing sequence %d/%d: %s", idx, total, seq_header)
+        total_valid = len(valid_tasks)
+        LOGGER.info(
+            "Prepared %d valid sequence tasks (pre-check failures: %d)",
+            total_valid,
+            len(rows_failures),
+        )
 
-            try:
-                aligned_pair = align_pair_with_mafft(
+        completed = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    process_sequence_task,
+                    cfg=cfg,
+                    idx=idx,
+                    seq_header=seq_header,
+                    final_key=final_key,
+                    seq_body=seq_body,
                     consensus_header=consensus_header,
                     consensus_seq=consensus_seq,
-                    query_header=seq_header,
-                    query_seq=seq_body,
-                    cfg=cfg,
-                    pair_input_path=pair_input,
-                    pair_aligned_path=pair_aligned,
+                    mutation_directions=mutation_directions,
+                    run_modes=run_modes,
+                    pair_input_dir=pair_input_dir,
+                    pair_aligned_dir=pair_aligned_dir,
+                    per_seq_dir=per_seq_dir,
                 )
-                write_fasta_records(aligned_pair, pair_aligned)
-
-                for mutation_from, mutation_to in mutation_directions:
-                    direction_tag = f"{mutation_from}to{mutation_to}"
-                    for mode in run_modes:
-                        run_info = run_hypermut_once(
-                            cfg=cfg,
-                            run_cfg=mode,
-                            aligned_pair_fasta=pair_aligned,
-                            seq_output_dir=seq_run_dir,
-                            mutation_from=mutation_from,
-                            mutation_to=mutation_to,
-                            direction_tag=direction_tag,
-                        )
-                        sum_row = read_single_hypermut_summary(
-                            Path(run_info["summary_csv"])
-                        )
-                        row_data = {
-                            "seq_header": seq_header,
-                            "final_group_key": final_key,
-                            "consensus_header": consensus_header,
-                            "pair_aligned_fasta": str(pair_aligned),
-                            "run_name": run_info["run_name"],
-                            "match": run_info["match"],
-                            "keepgaps": run_info["keepgaps"],
-                            "mutation_from": run_info["mutation_from"],
-                            "mutation_to": run_info["mutation_to"],
-                            "seq_name": sum_row["seq_name"],
-                            "primary_matches": sum_row["primary_matches"],
-                            "potential_primaries": sum_row["potential_primaries"],
-                            "control_matches": sum_row["control_matches"],
-                            "potential_controls": sum_row["potential_controls"],
-                            "rate_ratio": sum_row["rate_ratio"],
-                            "fisher_p": sum_row["fisher_p"],
-                            "summary_csv": run_info["summary_csv"],
-                            "positions_csv": run_info["positions_csv"],
-                        }
-                        append_row_to_csv(
-                            row_data,
-                            live_progress_csv,
-                            merged_csv_fieldnames,
-                        )
-                        rows_merged.append(row_data)
-
-            except Exception as exc:
-                LOGGER.exception("Failed sequence: %s", seq_header)
-                rows_failures.append(
-                    {
-                        "seq_header": seq_header,
-                        "final_group_key": final_key,
-                        "error": str(exc),
-                    }
+                for idx, seq_header, final_key, seq_body, consensus_header, consensus_seq in valid_tasks
+            ]
+            for future in as_completed(futures):
+                rows_batch, failure = future.result()
+                completed += 1
+                if failure is not None:
+                    rows_failures.append(failure)
+                    LOGGER.info(
+                        "Completed %d/%d (FAILED): %s | error=%s",
+                        completed,
+                        total_valid,
+                        failure.get("seq_header", ""),
+                        failure.get("error", ""),
+                    )
+                    continue
+                for row_data in rows_batch:
+                    append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
+                    append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
+                rows_merged.extend(rows_batch)
+                seq_name = rows_batch[0]["seq_header"] if rows_batch else ""
+                LOGGER.info(
+                    "Completed %d/%d: %s | runs=%d",
+                    completed,
+                    total_valid,
+                    seq_name,
+                    len(rows_batch),
                 )
 
-    try:
-        write_csv(rows_merged, merged_csv)
-    except PermissionError:
-        LOGGER.warning(
-            "Could not write final merged CSV because it is open: %s",
-            merged_csv,
-        )
+    LOGGER.info("Merged CSV was updated incrementally during processing: %s", merged_csv)
 
     failed_csv = cfg.output_dir / "per_sequence_hypermut_failures.csv"
     write_csv(rows_failures, failed_csv)
@@ -761,9 +929,17 @@ def parse_args() -> argparse.Namespace:
             "Default is false (fresh pairwise MAFFT + Hypermut run)."
         ),
     )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 1)),
+        help="Number of parallel sequence workers (default: CPU core count)",
+    )
     args = parser.parse_args()
     if args.number_of_sequence is not None and args.number_of_sequence <= 0:
         parser.error("--number-of-sequence must be a positive integer")
+    if args.parallel_workers is not None and args.parallel_workers <= 0:
+        parser.error("--parallel-workers must be a positive integer")
     return args
 
 
@@ -796,6 +972,7 @@ def main() -> None:
         run_all_mutation_directions=True,
         # False by default so first run computes pairwise alignments.
         reuse_existing_pairwise_alignments=args.reuse_existing_pairwise_alignments,
+        parallel_workers=args.parallel_workers,
         log_level="INFO",
     )
 
