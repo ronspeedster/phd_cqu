@@ -53,6 +53,7 @@ class PipelineConfig:
     run_all_mutation_directions: bool = False
     reuse_existing_pairwise_alignments: bool = False
     parallel_workers: int | None = None
+    hxb2_reference_fasta: Path | None = None
     log_level: str = "INFO"
 
 
@@ -71,6 +72,28 @@ def get_mutation_directions(cfg: PipelineConfig) -> list[tuple[str, str]]:
         bases = ["A", "C", "G", "T"]
         return [(base_from, base_to) for base_from in bases for base_to in bases if base_from != base_to]
     return [(cfg.mutation_from, cfg.mutation_to)]
+
+
+def ensure_hxb2_reference(data_dir: Path) -> Path:
+    hxb2_path = data_dir / "hxb2.fasta"
+    if hxb2_path.exists():
+        LOGGER.info("HXB2 reference already exists: %s", hxb2_path)
+        return hxb2_path
+    LOGGER.info("Downloading HXB2 reference from LANL...")
+    import urllib.request
+    url = (
+        "https://www.hiv.lanl.gov/cgi-bin/NEWALIGN/saveAlign.cgi"
+        "?format=fasta&alignID=HXB2&bg=genomicDNA"
+    )
+    try:
+        urllib.request.urlretrieve(url, hxb2_path)
+        LOGGER.info("HXB2 reference saved: %s", hxb2_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download HXB2 reference: {exc}. "
+            f"Please download manually and save to {hxb2_path}"
+        ) from exc
+    return hxb2_path
 
 
 # %% Cell 2 - FASTA and formatting helpers
@@ -592,6 +615,7 @@ def build_merged_row(
     query_seq: str,
     run_info: dict[str, str],
     sum_row: dict[str, str],
+    hxb2_p_value: str = "",
 ) -> dict[str, str]:
     con_trimmed, que_trimmed = _strip_flanking_gaps(consensus_seq, query_seq)
     mutation_counts = count_monomer_mutations(con_trimmed, que_trimmed)
@@ -606,7 +630,8 @@ def build_merged_row(
         "mutation_to": run_info["mutation_to"],
         "match_mode": run_info["match"],
         "keepgaps": run_info["keepgaps"],
-        "hypermut_p_value": sum_row["fisher_p"],
+        "hypermut_p_value_local": sum_row["fisher_p"],
+        "hypermut_p_value_hxb2": hxb2_p_value,
         "rate_ratio": sum_row["rate_ratio"],
         "primary_matches": sum_row["primary_matches"],
         "potential_primaries": sum_row["potential_primaries"],
@@ -624,6 +649,10 @@ def process_existing_pair_task(
     mutation_directions: list[tuple[str, str]],
     run_modes: list[HypermutRunConfig],
     per_seq_dir: Path,
+    hxb2_header: str = "",
+    hxb2_seq: str = "",
+    pair_input_hxb2_dir: Path | None = None,
+    pair_aligned_hxb2_dir: Path | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str] | None]:
     rows: list[dict[str, str]] = []
     pair_records = read_fasta_records(pair_aligned)
@@ -669,6 +698,54 @@ def process_existing_pair_task(
         }
 
     try:
+        hxb2_p_values: dict[tuple[str, str, str], str] = {}
+        if hxb2_seq and pair_input_hxb2_dir and pair_aligned_hxb2_dir:
+            hxb2_start_str = lanl_fields.get("HXB2/MAC239 start", "").strip()
+            hxb2_stop_str = lanl_fields.get("HXB2/MAC239 stop", "").strip()
+            hxb2_start = int(hxb2_start_str) if hxb2_start_str not in ("", "-", "0") else 0
+            hxb2_stop = int(hxb2_stop_str) if hxb2_stop_str not in ("", "-", "0") else 0
+
+            if hxb2_start > 0 and hxb2_stop > hxb2_start:
+                hxb2_region = hxb2_seq[hxb2_start - 1 : hxb2_stop]
+            else:
+                LOGGER.warning("Missing HXB2 coordinates for %s — skipping HXB2 p-value", seq_header)
+                hxb2_region = ""
+
+            if hxb2_region:
+                pair_input_hxb2 = pair_input_hxb2_dir / f"{seq_slug}.fasta"
+                pair_aligned_hxb2 = pair_aligned_hxb2_dir / f"{seq_slug}_aligned.fasta"
+                hxb2_run_dir = seq_run_dir / "hxb2"
+                hxb2_run_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    query_body = query_seq.replace("-", "")
+                    aligned_hxb2 = align_pair_with_mafft(
+                        consensus_header=hxb2_header,
+                        consensus_seq=hxb2_region,
+                        query_header=seq_header,
+                        query_seq=query_body,
+                        cfg=cfg,
+                        pair_input_path=pair_input_hxb2,
+                        pair_aligned_path=pair_aligned_hxb2,
+                    )
+                    write_fasta_records(aligned_hxb2, pair_aligned_hxb2)
+                    strip_pair_fasta_flanks(pair_aligned_hxb2)
+                    for mutation_from, mutation_to in mutation_directions:
+                        direction_tag = f"{mutation_from}to{mutation_to}"
+                        for mode in run_modes:
+                            hxb2_run_info = run_hypermut_once(
+                                cfg=cfg,
+                                run_cfg=mode,
+                                aligned_pair_fasta=pair_aligned_hxb2,
+                                seq_output_dir=hxb2_run_dir,
+                                mutation_from=mutation_from,
+                                mutation_to=mutation_to,
+                                direction_tag=f"hxb2_{direction_tag}",
+                            )
+                            hxb2_sum = read_single_hypermut_summary(Path(hxb2_run_info["summary_csv"]))
+                            hxb2_p_values[(mutation_from, mutation_to, mode.name)] = hxb2_sum["fisher_p"]
+                except Exception as exc:
+                    LOGGER.warning("HXB2 Hypermut3 failed for %s: %s", seq_header, exc)
+
         for mutation_from, mutation_to in mutation_directions:
             direction_tag = f"{mutation_from}to{mutation_to}"
             for mode in run_modes:
@@ -682,6 +759,7 @@ def process_existing_pair_task(
                     direction_tag=direction_tag,
                 )
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
+                hxb2_p = hxb2_p_values.get((mutation_from, mutation_to, mode.name), "")
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
@@ -690,6 +768,7 @@ def process_existing_pair_task(
                         query_seq=query_seq,
                         run_info=run_info,
                         sum_row=sum_row,
+                        hxb2_p_value=hxb2_p,
                     )
                 )
     except Exception as exc:
@@ -716,6 +795,10 @@ def process_sequence_task(
     pair_input_dir: Path,
     pair_aligned_dir: Path,
     per_seq_dir: Path,
+    hxb2_header: str = "",
+    hxb2_seq: str = "",
+    pair_input_hxb2_dir: Path | None = None,
+    pair_aligned_hxb2_dir: Path | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str] | None]:
     rows: list[dict[str, str]] = []
     seq_slug = f"{idx:04d}_{sanitize_file_component(seq_header)}"
@@ -756,6 +839,54 @@ def process_sequence_task(
                 "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
             }
 
+        hxb2_p_values: dict[tuple[str, str, str], str] = {}
+        if hxb2_seq and pair_input_hxb2_dir and pair_aligned_hxb2_dir:
+            hxb2_start_str = lanl_fields.get("HXB2/MAC239 start", "").strip()
+            hxb2_stop_str = lanl_fields.get("HXB2/MAC239 stop", "").strip()
+            hxb2_start = int(hxb2_start_str) if hxb2_start_str not in ("", "-", "0") else 0
+            hxb2_stop = int(hxb2_stop_str) if hxb2_stop_str not in ("", "-", "0") else 0
+
+            if hxb2_start > 0 and hxb2_stop > hxb2_start:
+                hxb2_region = hxb2_seq[hxb2_start - 1 : hxb2_stop]
+            else:
+                LOGGER.warning("Missing HXB2 coordinates for %s — skipping HXB2 p-value", seq_header)
+                hxb2_region = ""
+
+            if hxb2_region:
+                pair_input_hxb2 = pair_input_hxb2_dir / f"{seq_slug}.fasta"
+                pair_aligned_hxb2 = pair_aligned_hxb2_dir / f"{seq_slug}_aligned.fasta"
+                hxb2_run_dir = seq_run_dir / "hxb2"
+                hxb2_run_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    query_body = seq_body.replace("-", "")
+                    aligned_hxb2 = align_pair_with_mafft(
+                        consensus_header=hxb2_header,
+                        consensus_seq=hxb2_region,
+                        query_header=seq_header,
+                        query_seq=query_body,
+                        cfg=cfg,
+                        pair_input_path=pair_input_hxb2,
+                        pair_aligned_path=pair_aligned_hxb2,
+                    )
+                    write_fasta_records(aligned_hxb2, pair_aligned_hxb2)
+                    strip_pair_fasta_flanks(pair_aligned_hxb2)
+                    for mutation_from, mutation_to in mutation_directions:
+                        direction_tag = f"{mutation_from}to{mutation_to}"
+                        for mode in run_modes:
+                            hxb2_run_info = run_hypermut_once(
+                                cfg=cfg,
+                                run_cfg=mode,
+                                aligned_pair_fasta=pair_aligned_hxb2,
+                                seq_output_dir=hxb2_run_dir,
+                                mutation_from=mutation_from,
+                                mutation_to=mutation_to,
+                                direction_tag=f"hxb2_{direction_tag}",
+                            )
+                            hxb2_sum = read_single_hypermut_summary(Path(hxb2_run_info["summary_csv"]))
+                            hxb2_p_values[(mutation_from, mutation_to, mode.name)] = hxb2_sum["fisher_p"]
+                except Exception as exc:
+                    LOGGER.warning("HXB2 Hypermut3 failed for %s: %s", seq_header, exc)
+
         for mutation_from, mutation_to in mutation_directions:
             direction_tag = f"{mutation_from}to{mutation_to}"
             for mode in run_modes:
@@ -769,6 +900,7 @@ def process_sequence_task(
                     direction_tag=direction_tag,
                 )
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
+                hxb2_p = hxb2_p_values.get((mutation_from, mutation_to, mode.name), "")
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
@@ -777,6 +909,7 @@ def process_sequence_task(
                         query_seq=aligned_query_seq,
                         run_info=run_info,
                         sum_row=sum_row,
+                        hxb2_p_value=hxb2_p,
                     )
                 )
     except Exception as exc:
@@ -804,10 +937,26 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     pair_input_dir = cfg.output_dir / "pairwise_inputs"
     pair_aligned_dir = cfg.output_dir / "pairwise_aligned"
+    pair_input_hxb2_dir = cfg.output_dir / "pairwise_inputs_hxb2"
+    pair_aligned_hxb2_dir = cfg.output_dir / "pairwise_aligned_hxb2"
     per_seq_dir = cfg.output_dir / "per_sequence_hypermut"
     per_donor_dir = cfg.output_dir / "per_donor"
-    for path in [pair_input_dir, pair_aligned_dir, per_seq_dir, per_donor_dir]:
+    for path in [pair_input_dir, pair_aligned_dir, pair_input_hxb2_dir,
+                 pair_aligned_hxb2_dir, per_seq_dir, per_donor_dir]:
         path.mkdir(parents=True, exist_ok=True)
+
+    hxb2_header = ""
+    hxb2_seq = ""
+    if cfg.hxb2_reference_fasta and cfg.hxb2_reference_fasta.exists():
+        hxb2_records = read_fasta_records(cfg.hxb2_reference_fasta)
+        if hxb2_records:
+            hxb2_header = hxb2_records[0][0]
+            hxb2_seq = normalize_sequence(hxb2_records[0][1])
+            LOGGER.info("Loaded HXB2 reference: %s (%d bp)", hxb2_header, len(hxb2_seq))
+        else:
+            LOGGER.warning("HXB2 FASTA is empty: %s", cfg.hxb2_reference_fasta)
+    else:
+        LOGGER.warning("HXB2 reference not provided or not found — skipping HXB2 p-values")
 
     merged_csv = cfg.output_dir / "per_sequence_hypermut_merged.csv"
     live_progress_csv = (
@@ -897,7 +1046,8 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
         + ["consensus_header"]
         + MONOMER_MUTATION_COLUMNS
         + ["mutation_from", "mutation_to", "match_mode", "keepgaps"]
-        + ["hypermut_p_value", "rate_ratio", "primary_matches",
+        + ["hypermut_p_value_local", "hypermut_p_value_hxb2",
+           "rate_ratio", "primary_matches",
            "potential_primaries", "control_matches", "potential_controls"]
     )
     initialize_csv_file(merged_csv, merged_csv_fieldnames)
@@ -939,6 +1089,10 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     mutation_directions=mutation_directions,
                     run_modes=run_modes,
                     per_seq_dir=per_seq_dir,
+                    hxb2_header=hxb2_header,
+                    hxb2_seq=hxb2_seq,
+                    pair_input_hxb2_dir=pair_input_hxb2_dir,
+                    pair_aligned_hxb2_dir=pair_aligned_hxb2_dir,
                 )
                 for pair_aligned in aligned_files
             ]
@@ -1023,6 +1177,10 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     pair_input_dir=pair_input_dir,
                     pair_aligned_dir=pair_aligned_dir,
                     per_seq_dir=per_seq_dir,
+                    hxb2_header=hxb2_header,
+                    hxb2_seq=hxb2_seq,
+                    pair_input_hxb2_dir=pair_input_hxb2_dir,
+                    pair_aligned_hxb2_dir=pair_aligned_hxb2_dir,
                 )
                 for idx, seq_header, final_key, seq_body, consensus_header, consensus_seq in valid_tasks
             ]
@@ -1120,6 +1278,12 @@ def parse_args() -> argparse.Namespace:
         default=max(1, (os.cpu_count() or 1)),
         help="Number of parallel sequence workers (default: CPU core count)",
     )
+    parser.add_argument(
+        "--hxb2-reference",
+        type=Path,
+        default=None,
+        help="Path to HXB2 reference FASTA file. If not provided, auto-downloads from LANL.",
+    )
     args = parser.parse_args()
     if args.number_of_sequence is not None and args.number_of_sequence <= 0:
         parser.error("--number-of-sequence must be a positive integer")
@@ -1131,6 +1295,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     project_root = Path(__file__).resolve().parent
+
+    if args.hxb2_reference:
+        hxb2_fasta = args.hxb2_reference
+    else:
+        try:
+            hxb2_fasta = ensure_hxb2_reference(project_root / "data")
+        except RuntimeError as exc:
+            LOGGER.warning("%s — HXB2 p-values will be empty", exc)
+            hxb2_fasta = None
 
     cfg = PipelineConfig(
         group_manifest_csv=project_root
@@ -1155,9 +1328,9 @@ def main() -> None:
         finish=None,
         number_of_sequence=args.number_of_sequence,
         run_all_mutation_directions=True,
-        # False by default so first run computes pairwise alignments.
         reuse_existing_pairwise_alignments=args.reuse_existing_pairwise_alignments,
         parallel_workers=args.parallel_workers,
+        hxb2_reference_fasta=hxb2_fasta,
         log_level="INFO",
     )
 
