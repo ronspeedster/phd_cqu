@@ -18,6 +18,12 @@ import sys
 LOGGER = logging.getLogger("hypermute3_pairwise")
 DNA_STRICT_ALLOWED = set("ACGT-")
 
+LANL_HEADER_FIELDS: tuple[str, ...] = (
+    "Se ID", "Patient Code", "PAT id(SSAM)", "Accession", "Name",
+    "Subtype", "Country", "Sampling Year", "Problematic Sequence",
+    "HXB2/MAC239 start", "HXB2/MAC239 stop", "Sequence Length", "Organism",
+)
+
 
 @dataclass
 class HypermutRunConfig:
@@ -100,6 +106,14 @@ def write_fasta_records(
             handle.write(f">{header}\n")
             for idx in range(0, len(seq), 80):
                 handle.write(seq[idx : idx + 80] + "\n")
+
+
+def _parse_lanl_header(header: str) -> dict[str, str]:
+    parts = header.split(",")
+    parsed = {}
+    for i, field_name in enumerate(LANL_HEADER_FIELDS):
+        parsed[field_name] = parts[i].strip() if i < len(parts) else ""
+    return parsed
 
 
 def normalize_sequence(seq: str) -> str:
@@ -438,15 +452,17 @@ def create_csv_backup(source: Path, backup: Path) -> None:
 
 def build_merged_row(
     *,
-    seq_header: str,
+    lanl_fields: dict[str, str],
     final_key: str,
     consensus_header: str,
     pair_aligned: Path,
     run_info: dict[str, str],
     sum_row: dict[str, str],
 ) -> dict[str, str]:
-    return {
-        "seq_header": seq_header,
+    row: dict[str, str] = {}
+    for field_name in LANL_HEADER_FIELDS:
+        row[field_name] = lanl_fields.get(field_name, "")
+    row.update({
         "final_group_key": final_key,
         "consensus_header": consensus_header,
         "pair_aligned_fasta": str(pair_aligned),
@@ -464,7 +480,8 @@ def build_merged_row(
         "fisher_p": sum_row["fisher_p"],
         "summary_csv": run_info["summary_csv"],
         "positions_csv": run_info["positions_csv"],
-    }
+    })
+    return row
 
 
 def process_existing_pair_task(
@@ -493,6 +510,8 @@ def process_existing_pair_task(
     seq_run_dir = per_seq_dir / seq_slug
     seq_run_dir.mkdir(parents=True, exist_ok=True)
 
+    lanl_fields = _parse_lanl_header(seq_header)
+
     try:
         for mutation_from, mutation_to in mutation_directions:
             direction_tag = f"{mutation_from}to{mutation_to}"
@@ -509,7 +528,7 @@ def process_existing_pair_task(
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
                 rows.append(
                     build_merged_row(
-                        seq_header=seq_header,
+                        lanl_fields=lanl_fields,
                         final_key=final_key,
                         consensus_header=consensus_header,
                         pair_aligned=pair_aligned,
@@ -550,6 +569,8 @@ def process_sequence_task(
     seq_run_dir = per_seq_dir / seq_slug
     seq_run_dir.mkdir(parents=True, exist_ok=True)
 
+    lanl_fields = _parse_lanl_header(seq_header)
+
     try:
         aligned_pair = align_pair_with_mafft(
             consensus_header=consensus_header,
@@ -577,7 +598,7 @@ def process_sequence_task(
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
                 rows.append(
                     build_merged_row(
-                        seq_header=seq_header,
+                        lanl_fields=lanl_fields,
                         final_key=final_key,
                         consensus_header=consensus_header,
                         pair_aligned=pair_aligned,
@@ -697,8 +718,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     rows_merged: list[dict[str, str]] = []
     rows_failures: list[dict[str, str]] = []
 
-    merged_csv_fieldnames = [
-        "seq_header",
+    merged_csv_fieldnames = list(LANL_HEADER_FIELDS) + [
         "final_group_key",
         "consensus_header",
         "pair_aligned_fasta",
@@ -776,7 +796,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
                     append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
                 rows_merged.extend(rows_batch)
-                seq_name = rows_batch[0]["seq_header"] if rows_batch else ""
+                seq_name = rows_batch[0].get("Accession", "") if rows_batch else ""
                 LOGGER.info(
                     "Completed %d/%d: %s | runs=%d",
                     completed,
@@ -859,7 +879,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
                     append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
                 rows_merged.extend(rows_batch)
-                seq_name = rows_batch[0]["seq_header"] if rows_batch else ""
+                seq_name = rows_batch[0].get("Accession", "") if rows_batch else ""
                 LOGGER.info(
                     "Completed %d/%d: %s | runs=%d",
                     completed,

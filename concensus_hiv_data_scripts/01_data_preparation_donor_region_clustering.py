@@ -565,11 +565,17 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
 def main() -> None:
     project_root = Path(__file__).resolve().parent
     cfg = GroupedConfig(
+        # input_fasta=(
+        #     project_root
+        #     / "data"
+        #     / "hiv-db-any-unaligned.fasta"
+        # ),
         input_fasta=(
             project_root
             / "data"
-            / "hiv-db-any-unaligned.fasta"
-        ),
+            / "synthetic_data"
+            / "synthetic_output.fasta"
+        ),        
         output_dir=project_root / "data" / "processed_grouped",
         donor_field=DONOR_FIELD,
         coordinate_buffer=50,  # The +/- 50 buffer you requested
