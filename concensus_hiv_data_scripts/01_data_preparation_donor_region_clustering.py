@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import csv
@@ -54,6 +55,7 @@ class GroupedConfig:
     mafft_threads: int = -1
     unknown_donor_handling: str = "separate"  # separate | discard
     consensus_tie_priority: str = "ACGT"
+    max_sequences: int | None = None
     log_level: str = "INFO"
 
 
@@ -377,6 +379,10 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
     if not records:
         raise ValueError(f"No FASTA records found in {cfg.input_fasta}")
 
+    if cfg.max_sequences is not None and cfg.max_sequences > 0:
+        records = records[: cfg.max_sequences]
+        LOGGER.info("Limited to first %d sequences", len(records))
+
     if cfg.max_bin_size <= 0:
         raise ValueError("max_bin_size must be > 0")
 
@@ -562,30 +568,42 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
     return run_manifest
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Donor + region clustering pipeline for HIV FASTA data."
+    )
+    parser.add_argument(
+        "-i", "--input", required=True, help="Path to input FASTA file."
+    )
+    parser.add_argument(
+        "-o", "--output", required=True, help="Path to output directory."
+    )
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only the first N sequences from the input FASTA.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    project_root = Path(__file__).resolve().parent
+    args = parse_args()
+
     cfg = GroupedConfig(
-        # input_fasta=(
-        #     project_root
-        #     / "data"
-        #     / "hiv-db-any-unaligned.fasta"
-        # ),
-        input_fasta=(
-            project_root
-            / "data"
-            / "synthetic_data"
-            / "synthetic_output.fasta"
-        ),        
-        output_dir=project_root / "data" / "processed_grouped",
+        input_fasta=Path(args.input),
+        output_dir=Path(args.output),
         donor_field=DONOR_FIELD,
-        coordinate_buffer=50,  # The +/- 50 buffer you requested
-        min_bin_size=5,        # Changed to 5 so MAFFT has the minimum required to align
-        max_bin_size=10,       # Capped at 10 to meet adviser's optimum size
+        coordinate_buffer=50,
+        min_bin_size=5,
+        max_bin_size=10,
         force_mafft_alignment=True,
         mafft_binary="mafft",
         mafft_threads=-1,
         unknown_donor_handling="separate",
         consensus_tie_priority="ACGT",
+        max_sequences=args.limit,
         log_level="INFO",
     )
 
@@ -595,6 +613,11 @@ def main() -> None:
     print("Grouped pipeline completed. Outputs:")
     for key, value in results.items():
         print(f"- {key}: {value}")
+
+
+# Usage:
+# python 01_data_preparation_donor_region_clustering.py -i data/hiv-db-any-unaligned.fasta -o data/processed_grouped
+# python 01_data_preparation_donor_region_clustering.py -i data/hiv-db-any-unaligned.fasta -o data/processed_grouped -n 10
 
 
 if __name__ == "__main__":

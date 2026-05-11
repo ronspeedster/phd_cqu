@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import product
 import os
 from pathlib import Path
 import argparse
@@ -114,6 +115,124 @@ def _parse_lanl_header(header: str) -> dict[str, str]:
     for i, field_name in enumerate(LANL_HEADER_FIELDS):
         parsed[field_name] = parts[i].strip() if i < len(parts) else ""
     return parsed
+
+
+MONOMER_MUTATION_COLUMNS: list[str] = (
+    ["consensus_A_count", "consensus_G_count", "consensus_C_count", "consensus_T_count"]
+    + [f"{a}_to_{b}" for a in "ACGT" for b in "ACGT" if a != b]
+)
+
+
+def generate_nmer_mutation_columns(n: int) -> list[str]:
+    bases = "ACGT"
+    nmers = ["".join(combo) for combo in product(bases, repeat=n)]
+    columns = []
+    for src in nmers:
+        for dst in nmers:
+            if src != dst:
+                columns.append(f"{src}_to_{dst}")
+    return columns
+
+
+def count_monomer_mutations(consensus: str, query: str) -> dict[str, int]:
+    counts: dict[str, int] = {col: 0 for col in MONOMER_MUTATION_COLUMNS}
+    for c_base, q_base in zip(consensus.upper(), query.upper()):
+        if c_base == "-" and q_base == "-":
+            continue
+        if c_base in "ACGT":
+            counts[f"consensus_{c_base}_count"] += 1
+            if q_base in "ACGT" and c_base != q_base:
+                counts[f"{c_base}_to_{q_base}"] += 1
+    return counts
+
+
+def count_nmer_mutations(consensus: str, query: str, n: int) -> dict[str, int]:
+    columns = generate_nmer_mutation_columns(n)
+    counts: dict[str, int] = {col: 0 for col in columns}
+    con_upper = consensus.upper()
+    que_upper = query.upper()
+    for i in range(len(con_upper) - n + 1):
+        c_kmer = con_upper[i : i + n]
+        q_kmer = que_upper[i : i + n]
+        if "-" in c_kmer or "-" in q_kmer:
+            continue
+        if all(b in "ACGT" for b in c_kmer) and all(b in "ACGT" for b in q_kmer):
+            if c_kmer != q_kmer:
+                key = f"{c_kmer}_to_{q_kmer}"
+                if key in counts:
+                    counts[key] += 1
+    return counts
+
+
+def _strip_flanking_gaps(consensus: str, query: str) -> tuple[str, str]:
+    start = 0
+    while start < len(consensus) and (consensus[start] == "-" or query[start] == "-"):
+        start += 1
+    end = len(consensus)
+    while end > start and (consensus[end - 1] == "-" or query[end - 1] == "-"):
+        end -= 1
+    return consensus[start:end], query[start:end]
+
+
+def strip_pair_fasta_flanks(fasta_path: Path) -> None:
+    records = read_fasta_records(fasta_path)
+    if len(records) < 2:
+        return
+    con_trimmed, que_trimmed = _strip_flanking_gaps(records[0][1], records[1][1])
+    write_fasta_records(
+        [(records[0][0], con_trimmed), (records[1][0], que_trimmed)],
+        fasta_path,
+    )
+
+
+@dataclass
+class AlignmentQC:
+    aligned_positions: int
+    total_positions: int
+    gap_fraction_consensus: float
+    gap_fraction_query: float
+    identity: float
+    passed: bool
+
+
+def validate_alignment_quality(
+    consensus: str,
+    query: str,
+    min_identity: float = 0.3,
+    max_gap_fraction: float = 0.5,
+) -> AlignmentQC:
+    total = len(consensus)
+    if total == 0:
+        return AlignmentQC(0, 0, 1.0, 1.0, 0.0, False)
+
+    con_upper = consensus.upper()
+    que_upper = query.upper()
+
+    gaps_c = sum(1 for b in con_upper if b == "-")
+    gaps_q = sum(1 for b in que_upper if b == "-")
+    gap_frac_c = gaps_c / total
+    gap_frac_q = gaps_q / total
+
+    aligned = 0
+    matches = 0
+    for c_base, q_base in zip(con_upper, que_upper):
+        if c_base == "-" or q_base == "-":
+            continue
+        aligned += 1
+        if c_base == q_base:
+            matches += 1
+
+    identity = matches / aligned if aligned > 0 else 0.0
+    passed = identity >= min_identity and gap_frac_q <= max_gap_fraction
+
+    return AlignmentQC(
+        aligned_positions=aligned,
+        total_positions=total,
+        gap_fraction_consensus=gap_frac_c,
+        gap_fraction_query=gap_frac_q,
+        identity=identity,
+        passed=passed,
+    )
 
 
 def normalize_sequence(seq: str) -> str:
@@ -450,36 +569,49 @@ def create_csv_backup(source: Path, backup: Path) -> None:
         LOGGER.info("Created empty backup (source does not exist): %s", backup)
 
 
+def append_row_to_per_donor_csv(
+    row: dict[str, str],
+    per_donor_dir: Path,
+    fieldnames: list[str],
+) -> None:
+    donor_id = row.get("PAT id(SSAM)", "").strip()
+    if not donor_id or donor_id == "-":
+        donor_id = row.get("Patient Code", "").strip()
+    if not donor_id or donor_id == "-":
+        donor_id = "unknown_donor"
+    donor_id = re.sub(r"[^A-Za-z0-9._-]+", "_", donor_id).strip("_")[:90]
+    donor_csv = per_donor_dir / f"{donor_id}.csv"
+    append_row_to_csv(row, donor_csv, fieldnames)
+
+
 def build_merged_row(
     *,
     lanl_fields: dict[str, str],
-    final_key: str,
     consensus_header: str,
-    pair_aligned: Path,
+    consensus_seq: str,
+    query_seq: str,
     run_info: dict[str, str],
     sum_row: dict[str, str],
 ) -> dict[str, str]:
+    con_trimmed, que_trimmed = _strip_flanking_gaps(consensus_seq, query_seq)
+    mutation_counts = count_monomer_mutations(con_trimmed, que_trimmed)
     row: dict[str, str] = {}
     for field_name in LANL_HEADER_FIELDS:
         row[field_name] = lanl_fields.get(field_name, "")
+    row["consensus_header"] = consensus_header
+    for col, val in mutation_counts.items():
+        row[col] = str(val)
     row.update({
-        "final_group_key": final_key,
-        "consensus_header": consensus_header,
-        "pair_aligned_fasta": str(pair_aligned),
-        "run_name": run_info["run_name"],
-        "match": run_info["match"],
-        "keepgaps": run_info["keepgaps"],
         "mutation_from": run_info["mutation_from"],
         "mutation_to": run_info["mutation_to"],
-        "seq_name": sum_row["seq_name"],
+        "match_mode": run_info["match"],
+        "keepgaps": run_info["keepgaps"],
+        "hypermut_p_value": sum_row["fisher_p"],
+        "rate_ratio": sum_row["rate_ratio"],
         "primary_matches": sum_row["primary_matches"],
         "potential_primaries": sum_row["potential_primaries"],
         "control_matches": sum_row["control_matches"],
         "potential_controls": sum_row["potential_controls"],
-        "rate_ratio": sum_row["rate_ratio"],
-        "fisher_p": sum_row["fisher_p"],
-        "summary_csv": run_info["summary_csv"],
-        "positions_csv": run_info["positions_csv"],
     })
     return row
 
@@ -503,7 +635,9 @@ def process_existing_pair_task(
         }
 
     consensus_header = pair_records[0][0]
+    consensus_seq = pair_records[0][1]
     seq_header = pair_records[1][0]
+    query_seq = pair_records[1][1]
     LOGGER.info("Processing sequence (reuse mode): %s", seq_header)
     final_key = seq_to_group.get(seq_header, "")
     seq_slug = pair_aligned.name.replace("_aligned.fasta", "")
@@ -512,6 +646,28 @@ def process_existing_pair_task(
 
     lanl_fields = _parse_lanl_header(seq_header)
 
+    con_trimmed, que_trimmed = _strip_flanking_gaps(consensus_seq, query_seq)
+    consensus_seq = con_trimmed
+    query_seq = que_trimmed
+
+    stripped_path = seq_run_dir / "stripped_aligned.fasta"
+    write_fasta_records(
+        [(consensus_header, consensus_seq), (seq_header, query_seq)],
+        stripped_path,
+    )
+
+    qc = validate_alignment_quality(consensus_seq, query_seq)
+    if not qc.passed:
+        LOGGER.warning(
+            "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — skipping Hypermut3",
+            seq_header, qc.identity, qc.gap_fraction_query,
+        )
+        return [], {
+            "seq_header": seq_header,
+            "final_group_key": final_key,
+            "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
+        }
+
     try:
         for mutation_from, mutation_to in mutation_directions:
             direction_tag = f"{mutation_from}to{mutation_to}"
@@ -519,7 +675,7 @@ def process_existing_pair_task(
                 run_info = run_hypermut_once(
                     cfg=cfg,
                     run_cfg=mode,
-                    aligned_pair_fasta=pair_aligned,
+                    aligned_pair_fasta=stripped_path,
                     seq_output_dir=seq_run_dir,
                     mutation_from=mutation_from,
                     mutation_to=mutation_to,
@@ -529,9 +685,9 @@ def process_existing_pair_task(
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
-                        final_key=final_key,
                         consensus_header=consensus_header,
-                        pair_aligned=pair_aligned,
+                        consensus_seq=consensus_seq,
+                        query_seq=query_seq,
                         run_info=run_info,
                         sum_row=sum_row,
                     )
@@ -582,6 +738,23 @@ def process_sequence_task(
             pair_aligned_path=pair_aligned,
         )
         write_fasta_records(aligned_pair, pair_aligned)
+        strip_pair_fasta_flanks(pair_aligned)
+        aligned_pair = read_fasta_records(pair_aligned)
+
+        aligned_consensus_seq = aligned_pair[0][1]
+        aligned_query_seq = aligned_pair[1][1]
+
+        qc = validate_alignment_quality(aligned_consensus_seq, aligned_query_seq)
+        if not qc.passed:
+            LOGGER.warning(
+                "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — skipping Hypermut3",
+                seq_header, qc.identity, qc.gap_fraction_query,
+            )
+            return [], {
+                "seq_header": seq_header,
+                "final_group_key": final_key,
+                "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
+            }
 
         for mutation_from, mutation_to in mutation_directions:
             direction_tag = f"{mutation_from}to{mutation_to}"
@@ -599,9 +772,9 @@ def process_sequence_task(
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
-                        final_key=final_key,
                         consensus_header=consensus_header,
-                        pair_aligned=pair_aligned,
+                        consensus_seq=aligned_consensus_seq,
+                        query_seq=aligned_query_seq,
                         run_info=run_info,
                         sum_row=sum_row,
                     )
@@ -632,7 +805,8 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     pair_input_dir = cfg.output_dir / "pairwise_inputs"
     pair_aligned_dir = cfg.output_dir / "pairwise_aligned"
     per_seq_dir = cfg.output_dir / "per_sequence_hypermut"
-    for path in [pair_input_dir, pair_aligned_dir, per_seq_dir]:
+    per_donor_dir = cfg.output_dir / "per_donor"
+    for path in [pair_input_dir, pair_aligned_dir, per_seq_dir, per_donor_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
     merged_csv = cfg.output_dir / "per_sequence_hypermut_merged.csv"
@@ -718,25 +892,14 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     rows_merged: list[dict[str, str]] = []
     rows_failures: list[dict[str, str]] = []
 
-    merged_csv_fieldnames = list(LANL_HEADER_FIELDS) + [
-        "final_group_key",
-        "consensus_header",
-        "pair_aligned_fasta",
-        "run_name",
-        "match",
-        "keepgaps",
-        "mutation_from",
-        "mutation_to",
-        "seq_name",
-        "primary_matches",
-        "potential_primaries",
-        "control_matches",
-        "potential_controls",
-        "rate_ratio",
-        "fisher_p",
-        "summary_csv",
-        "positions_csv",
-    ]
+    merged_csv_fieldnames = (
+        list(LANL_HEADER_FIELDS)
+        + ["consensus_header"]
+        + MONOMER_MUTATION_COLUMNS
+        + ["mutation_from", "mutation_to", "match_mode", "keepgaps"]
+        + ["hypermut_p_value", "rate_ratio", "primary_matches",
+           "potential_primaries", "control_matches", "potential_controls"]
+    )
     initialize_csv_file(merged_csv, merged_csv_fieldnames)
     initialize_csv_file(live_progress_csv, merged_csv_fieldnames)
 
@@ -795,6 +958,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                 for row_data in rows_batch:
                     append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
                     append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
+                    append_row_to_per_donor_csv(row_data, per_donor_dir, merged_csv_fieldnames)
                 rows_merged.extend(rows_batch)
                 seq_name = rows_batch[0].get("Accession", "") if rows_batch else ""
                 LOGGER.info(
@@ -878,6 +1042,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                 for row_data in rows_batch:
                     append_row_to_csv(row_data, merged_csv, merged_csv_fieldnames)
                     append_row_to_csv(row_data, live_progress_csv, merged_csv_fieldnames)
+                    append_row_to_per_donor_csv(row_data, per_donor_dir, merged_csv_fieldnames)
                 rows_merged.extend(rows_batch)
                 seq_name = rows_batch[0].get("Accession", "") if rows_batch else ""
                 LOGGER.info(
