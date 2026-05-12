@@ -55,6 +55,7 @@ class PipelineConfig:
     parallel_workers: int | None = None
     hxb2_reference_fasta: Path | None = None
     log_level: str = "INFO"
+    full_run: bool = False
 
 
 def configure_logging(log_level: str) -> None:
@@ -979,12 +980,19 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
             len(seq_to_group),
         )
 
-    run_modes = [
-        HypermutRunConfig(name="strict-keepgaps", match="strict", keepgaps=True),
-        HypermutRunConfig(name="strict-skipgaps", match="strict", keepgaps=False),
-        HypermutRunConfig(name="partial-keepgaps", match="partial", keepgaps=True),
-        HypermutRunConfig(name="partial-skipgaps", match="partial", keepgaps=False),
-    ]
+    if cfg.full_run:
+        run_modes = [
+            HypermutRunConfig(name="strict-keepgaps", match="strict", keepgaps=True),
+            HypermutRunConfig(name="strict-skipgaps", match="strict", keepgaps=False),
+            HypermutRunConfig(name="partial-keepgaps", match="partial", keepgaps=True),
+            HypermutRunConfig(name="partial-skipgaps", match="partial", keepgaps=False),
+        ]
+        LOGGER.info("Full run mode: all 4 Hypermut3 configurations enabled")
+    else:
+        run_modes = [
+            HypermutRunConfig(name="partial-skipgaps", match="partial", keepgaps=False),
+        ]
+        LOGGER.info("Default run mode: partial-skipgaps only (use --full-run true for all 4 modes)")
     mutation_directions = get_mutation_directions(cfg)
     LOGGER.info("Mutation directions configured: %d", len(mutation_directions))
     if cfg.run_all_mutation_directions:
@@ -1284,6 +1292,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to HXB2 reference FASTA file. If not provided, auto-downloads from LANL.",
     )
+    parser.add_argument(
+        "--full-run",
+        type=parse_bool,
+        default=False,
+        help=(
+            "Run all 4 Hypermut3 modes (strict/partial × keepgaps/skipgaps). "
+            "Default is false (partial-skipgaps only)."
+        ),
+    )
     args = parser.parse_args()
     if args.number_of_sequence is not None and args.number_of_sequence <= 0:
         parser.error("--number-of-sequence must be a positive integer")
@@ -1332,6 +1349,7 @@ def main() -> None:
         parallel_workers=args.parallel_workers,
         hxb2_reference_fasta=hxb2_fasta,
         log_level="INFO",
+        full_run=args.full_run,
     )
 
     configure_logging(cfg.log_level)
@@ -1344,3 +1362,19 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ──────────────────────────────────────────────────────────────
+# Usage:
+#
+#   Default (partial-skipgaps only):
+#     python 02_hypermut3.py
+#
+#   Full run (all 4 modes: strict/partial × keepgaps/skipgaps):
+#     python 02_hypermut3.py --full-run true
+#
+#   Other flags:
+#     --number-of-sequence N                          Run first N sequences only
+#     --parallel-workers N                            Number of parallel workers
+#     --reuse-existing-pairwise-alignments true       Reuse existing pairwise FASTA
+#     --hxb2-reference path/to/hxb2.fasta             Custom HXB2 reference
+# ──────────────────────────────────────────────────────────────
