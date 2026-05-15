@@ -56,6 +56,7 @@ class PipelineConfig:
     hxb2_reference_fasta: Path | None = None
     log_level: str = "INFO"
     full_run: bool = False
+    problematic_only: bool = False
 
 
 def configure_logging(log_level: str) -> None:
@@ -139,6 +140,12 @@ def _parse_lanl_header(header: str) -> dict[str, str]:
     for i, field_name in enumerate(LANL_HEADER_FIELDS):
         parsed[field_name] = parts[i].strip() if i < len(parts) else ""
     return parsed
+
+
+def _is_problematic(seq_header: str) -> bool:
+    """Return True if the sequence is marked as problematic (value 3)."""
+    fields = _parse_lanl_header(seq_header)
+    return fields.get("Problematic Sequence", "").strip() == "3"
 
 
 MONOMER_MUTATION_COLUMNS: list[str] = (
@@ -1078,6 +1085,27 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                 "Sequence limit enabled: running first %d aligned FASTA files",
                 len(aligned_files),
             )
+
+        if cfg.problematic_only:
+            filtered_files: list[Path] = []
+            for fasta_path in aligned_files:
+                records = read_fasta_records(fasta_path)
+                if len(records) < 2:
+                    continue
+                seq_header = records[1][0]
+                if _is_problematic(seq_header):
+                    filtered_files.append(fasta_path)
+                else:
+                    LOGGER.info(
+                        "Skipping non-problematic sequence: %s",
+                        seq_header[:120],
+                    )
+            LOGGER.info(
+                "Problematic-only filter: %d / %d sequences retained",
+                len(filtered_files), len(aligned_files),
+            )
+            aligned_files = filtered_files
+
         total = len(aligned_files)
         LOGGER.info(
             "Hypermut-only mode: reusing %d existing pairwise aligned FASTA files (no MAFFT run)",
@@ -1132,6 +1160,13 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
     else:
         valid_tasks: list[tuple[int, str, str, str, str, str]] = []
         for idx, (seq_header, _, final_key) in enumerate(sequence_records, start=1):
+            if cfg.problematic_only and not _is_problematic(seq_header):
+                LOGGER.info(
+                    "Skipping non-problematic sequence: %s",
+                    seq_header[:120],
+                )
+                continue
+
             seq_body = query_map.get(seq_header)
             if seq_body is None:
                 rows_failures.append(
@@ -1295,8 +1330,18 @@ def parse_args() -> argparse.Namespace:
         type=parse_bool,
         default=False,
         help=(
-            "Run all 4 Hypermut3 modes (strict/partial × keepgaps/skipgaps). "
-            "Default is false (partial-skipgaps only)."
+            "Run all 4 Hypermut3 modes (strict/partial × keepgaps/skipgaps) "
+            "and all 12 mutation directions. Default is false "
+            "(G→A, strict, keepgaps only)."
+        ),
+    )
+    parser.add_argument(
+        "--problematic-only",
+        type=parse_bool,
+        default=False,
+        help=(
+            "Only process sequences marked as problematic (value 3). "
+            "Default is false (process all sequences)."
         ),
     )
     args = parser.parse_args()
@@ -1348,6 +1393,7 @@ def main() -> None:
         hxb2_reference_fasta=hxb2_fasta,
         log_level="INFO",
         full_run=args.full_run,
+        problematic_only=args.problematic_only,
     )
 
     configure_logging(cfg.log_level)
@@ -1369,6 +1415,9 @@ if __name__ == "__main__":
 #
 #   Full run (all 12 mutation directions × all 4 modes):
 #     python 02_hypermut3.py --full-run true
+#
+#   Problematic sequences only (skip non-problematic):
+#     python 02_hypermut3.py --problematic-only true
 #
 #   Other flags:
 #     --number-of-sequence N                          Run first N sequences only

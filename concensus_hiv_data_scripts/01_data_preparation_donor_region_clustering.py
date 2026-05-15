@@ -48,7 +48,7 @@ class GroupedConfig:
     output_dir: Path
     donor_field: str = DONOR_FIELD
     coordinate_buffer: int = 50
-    min_bin_size: int = 5  # MAFFT requires at least 5 to align
+    min_bin_size: int = 5  # Minimum sequences per group for meaningful consensus
     max_bin_size: int = 10 # Adviser requested max of 10
     force_mafft_alignment: bool = True
     mafft_binary: str = "mafft"
@@ -178,11 +178,12 @@ def build_donor_bins(
 def cluster_by_region(
     records: list[SequenceRecord], 
     buffer: int
-) -> tuple[list[list[SequenceRecord]], list[list[SequenceRecord]]]:
+) -> tuple[list[tuple[list[SequenceRecord], int, int]], list[tuple[list[SequenceRecord], int, int]]]:
     """
     Clusters sequences based on HXB2/MAC239 start and stop coordinates.
     Two sequences belong to the same cluster if their buffered coordinate ranges overlap.
     Returns: (valid_clusters, missing_coordinate_clusters)
+    Each cluster entry is (records, cluster_start, cluster_stop).
     """
     valid_recs = []
     missing_recs = []
@@ -193,56 +194,141 @@ def cluster_by_region(
         stop = safe_int(fields.get(STOP_FIELD))
         
         if start is not None and stop is not None:
-            # Ensure start is always the lower number just in case
             actual_start = min(start, stop)
             actual_stop = max(start, stop)
             valid_recs.append((actual_start, actual_stop, r))
         else:
             missing_recs.append(r)
             
-    # Sort valid records primarily by start coordinate
     valid_recs.sort(key=lambda x: x[0])
     
-    clusters: list[list[SequenceRecord]] = []
+    clusters: list[tuple[list[SequenceRecord], int, int]] = []
     
     if valid_recs:
-        # Initialize the first cluster
         current_cluster = [valid_recs[0][2]]
         current_start = valid_recs[0][0] - buffer
         current_stop = valid_recs[0][1] + buffer
+        cluster_real_start = valid_recs[0][0]
+        cluster_real_stop = valid_recs[0][1]
         
         for start, stop, rec in valid_recs[1:]:
             rec_start = start - buffer
             rec_stop = stop + buffer
             
-            # Check for overlap: does the new sequence start before the current cluster ends?
             if rec_start <= current_stop:
                 current_cluster.append(rec)
-                # Expand the bounding box of the cluster to the right if needed
                 current_stop = max(current_stop, rec_stop)
+                cluster_real_stop = max(cluster_real_stop, stop)
             else:
-                # No overlap, finish the old cluster and start a new one
-                clusters.append(current_cluster)
+                clusters.append((current_cluster, cluster_real_start, cluster_real_stop))
                 current_cluster = [rec]
                 current_start = rec_start
                 current_stop = rec_stop
+                cluster_real_start = start
+                cluster_real_stop = stop
                 
-        # Append the final cluster
-        clusters.append(current_cluster)
+        clusters.append((current_cluster, cluster_real_start, cluster_real_stop))
 
-    return clusters, ([missing_recs] if missing_recs else [])
+    missing_clusters: list[tuple[list[SequenceRecord], int, int]] = []
+    if missing_recs:
+        missing_clusters.append((missing_recs, 0, 0))
+
+    return clusters, missing_clusters
+
+
+def merge_small_region_clusters(
+    clusters: list[tuple[list[SequenceRecord], int, int]],
+    min_size: int,
+) -> list[tuple[list[SequenceRecord], int, int]]:
+    """
+    Merges region clusters with fewer than min_size sequences into the nearest
+    cluster (by coordinate center distance). If all clusters are small, merges
+    them all into one.
+    """
+    if not clusters:
+        return clusters
+
+    if len(clusters) == 1:
+        return clusters
+
+    records_list, starts, stops = [], [], []
+    for recs, s, e in clusters:
+        records_list.append(recs)
+        starts.append(s)
+        stops.append(e)
+
+    centers = [(s + e) / 2.0 for s, e in zip(starts, stops)]
+    sizes = [len(recs) for recs in records_list]
+    merged_into: dict[int, int] = {}
+
+    small_indices = [i for i, sz in enumerate(sizes) if sz < min_size]
+    large_indices = [i for i, sz in enumerate(sizes) if sz >= min_size]
+
+    if not large_indices:
+        all_records: list[SequenceRecord] = []
+        all_start = min(starts)
+        all_stop = max(stops)
+        for recs in records_list:
+            all_records.extend(recs)
+        return [(all_records, all_start, all_stop)]
+
+    for si in small_indices:
+        best_target = min(large_indices, key=lambda li: abs(centers[si] - centers[li]))
+        merged_into[si] = best_target
+
+    result: list[tuple[list[SequenceRecord], int, int]] = []
+    bucket_records: dict[int, list[SequenceRecord]] = {}
+    bucket_start: dict[int, int] = {}
+    bucket_stop: dict[int, int] = {}
+
+    for i in range(len(clusters)):
+        if i in merged_into:
+            target = merged_into[i]
+            bucket_records.setdefault(target, []).extend(records_list[i])
+            bucket_start[target] = min(bucket_start.get(target, starts[i]), starts[i])
+            bucket_stop[target] = max(bucket_stop.get(target, stops[i]), stops[i])
+        else:
+            bucket_records.setdefault(i, []).extend(records_list[i])
+            bucket_start[i] = min(bucket_start.get(i, starts[i]), starts[i])
+            bucket_stop[i] = max(bucket_stop.get(i, stops[i]), stops[i])
+
+    for i in sorted(bucket_records.keys()):
+        result.append((bucket_records[i], bucket_start[i], bucket_stop[i]))
+
+    LOGGER.info(
+        "Merged %d small clusters (min_size=%d) into %d remaining clusters",
+        len(small_indices),
+        min_size,
+        len(result),
+    )
+    return result
 
 
 def split_cluster_to_bins(
     cluster_records: list[SequenceRecord],
     max_size: int,
+    min_size: int = 3,
 ) -> list[list[SequenceRecord]]:
+    if len(cluster_records) <= max_size:
+        return [cluster_records]
+
     bins: list[list[SequenceRecord]] = []
     for idx in range(0, len(cluster_records), max_size):
         bins.append(cluster_records[idx : idx + max_size])
 
-    # Avoid trailing singleton bins by merging with the previous chunk if possible
-    if len(bins) >= 2 and len(bins[-1]) == 1 and len(bins[-2]) < max_size:
+    while len(bins) >= 2 and len(bins[-1]) < min_size:
+        shortfall = min_size - len(bins[-1])
+        available = len(bins[-2])
+        if available - shortfall >= min_size:
+            transfer = bins[-2][-shortfall:]
+            bins[-2] = bins[-2][:-shortfall]
+            bins[-1] = transfer + bins[-1]
+            break
+        else:
+            bins[-2].extend(bins[-1])
+            bins.pop()
+
+    if len(bins) >= 2 and len(bins[-1]) < min_size:
         bins[-2].extend(bins[-1])
         bins.pop()
 
@@ -404,18 +490,22 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
             buffer=cfg.coordinate_buffer
         )
         
-        all_donor_clusters = valid_region_clusters + missing_coords_clusters
+        all_donor_clusters_raw = valid_region_clusters + missing_coords_clusters
         
         LOGGER.info(
             "[Donor %s] Found %d regional clusters for %d sequences",
             donor_label,
-            len(all_donor_clusters),
+            len(all_donor_clusters_raw),
             len(donor_records),
         )
 
+        all_donor_clusters = merge_small_region_clusters(
+            all_donor_clusters_raw, cfg.min_bin_size
+        )
+
         # LEVEL 3: Enforce max_bin_size chunks (10 sequences)
-        for region_idx, cluster_records in enumerate(all_donor_clusters, start=1):
-            chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size)
+        for region_idx, (cluster_records, _cstart, _cstop) in enumerate(all_donor_clusters, start=1):
+            chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size, cfg.min_bin_size)
             
             for bin_idx, bin_records in enumerate(chunked_bins, start=1):
                 final_key = f"Donor={donor_label}|RegionId={region_idx}|BinId={bin_idx}"
@@ -443,10 +533,14 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
                 unknown_records, 
                 buffer=cfg.coordinate_buffer
             )
-            all_unknown_clusters = valid_region_clusters + missing_coords_clusters
+            all_unknown_clusters_raw = valid_region_clusters + missing_coords_clusters
+
+            all_unknown_clusters = merge_small_region_clusters(
+                all_unknown_clusters_raw, cfg.min_bin_size
+            )
             
-            for region_idx, cluster_records in enumerate(all_unknown_clusters, start=1):
-                chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size)
+            for region_idx, (cluster_records, _cstart, _cstop) in enumerate(all_unknown_clusters, start=1):
+                chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size, cfg.min_bin_size)
                 
                 for bin_idx, bin_records in enumerate(chunked_bins, start=1):
                     final_key = f"Donor=UNKNOWN|RegionId={region_idx}|BinId={bin_idx}"
@@ -463,6 +557,44 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
                         )
                     )
 
+    # CROSS-DONOR MERGE: collect undersized groups and re-cluster by region
+    valid_bins = []
+    undersized_records: list[SequenceRecord] = []
+    for entry in final_bins:
+        _donor, _rid, _bid, group_recs, _src = entry
+        if len(group_recs) < cfg.min_bin_size:
+            undersized_records.extend(group_recs)
+        else:
+            valid_bins.append(entry)
+
+    if undersized_records:
+        LOGGER.info(
+            "Cross-donor merge: %d undersized sequences from %d groups, re-clustering by region",
+            len(undersized_records),
+            len(final_bins) - len(valid_bins),
+        )
+        cross_valid, cross_missing = cluster_by_region(
+            undersized_records, buffer=cfg.coordinate_buffer
+        )
+        cross_all = cross_valid + cross_missing
+        cross_merged = merge_small_region_clusters(cross_all, cfg.min_bin_size)
+
+        for region_idx, (cluster_records, _cs, _ce) in enumerate(cross_merged, start=1):
+            chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size, cfg.min_bin_size)
+            for bin_idx, bin_records in enumerate(chunked_bins, start=1):
+                for rec in bin_records:
+                    seq_to_final_key[rec.header] = f"Donor=CROSSDONOR|RegionId={region_idx}|BinId={bin_idx}"
+                valid_bins.append(
+                    (None, region_idx, bin_idx, bin_records, "Donor=CROSSDONOR")
+                )
+
+        LOGGER.info(
+            "Cross-donor merge complete: %d final groups (%d undersized sequences absorbed)",
+            len(valid_bins),
+            len(undersized_records),
+        )
+    final_bins = valid_bins
+
     LOGGER.info(
         "Proceeding with %d final bins from %d sequences",
         len(final_bins),
@@ -477,7 +609,7 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
 
     for group_index, (donor, region_id, bin_id, group_records, source_key) in enumerate(final_bins, start=1):
         group_size = len(group_records)
-        donor_text = str(donor) if donor is not None else "UNKNOWN"
+        donor_text = "CROSSDONOR" if source_key == "Donor=CROSSDONOR" else (str(donor) if donor is not None else "UNKNOWN")
 
         group_tag = f"group_{group_index:03d}"
         final_group_key = f"Donor={donor_text}|RegionId={region_id}|BinId={bin_id}"
