@@ -987,9 +987,9 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
         LOGGER.info("Full run mode: all 4 Hypermut3 configurations enabled")
     else:
         run_modes = [
-            HypermutRunConfig(name="partial-skipgaps", match="partial", keepgaps=False),
+            HypermutRunConfig(name="strict-keepgaps", match="strict", keepgaps=True),
         ]
-        LOGGER.info("Default run mode: partial-skipgaps only (use --full-run true for all 4 modes)")
+        LOGGER.info("Default run mode: strict-keepgaps only (use --full-run true for all 4 modes + all mutation directions)")
     mutation_directions = get_mutation_directions(cfg)
     LOGGER.info("Mutation directions configured: %d", len(mutation_directions))
     if cfg.run_all_mutation_directions:
@@ -1342,7 +1342,7 @@ def main() -> None:
         begin=0,
         finish=None,
         number_of_sequence=args.number_of_sequence,
-        run_all_mutation_directions=True,
+        run_all_mutation_directions=args.full_run,
         reuse_existing_pairwise_alignments=args.reuse_existing_pairwise_alignments,
         parallel_workers=args.parallel_workers,
         hxb2_reference_fasta=hxb2_fasta,
@@ -1364,10 +1364,10 @@ if __name__ == "__main__":
 # ──────────────────────────────────────────────────────────────
 # Usage:
 #
-#   Default (partial-skipgaps only):
+#   Default (G→A, strict, keepgaps — 1 check per sequence):
 #     python 02_hypermut3.py
 #
-#   Full run (all 4 modes: strict/partial × keepgaps/skipgaps):
+#   Full run (all 12 mutation directions × all 4 modes):
 #     python 02_hypermut3.py --full-run true
 #
 #   Other flags:
