@@ -367,18 +367,6 @@ def align_pair_with_mafft(
     ]
 
 
-def sanitize_reference_for_partial(
-    input_fasta: Path,
-    output_fasta: Path,
-) -> None:
-    records = read_fasta_records(input_fasta)
-    if not records:
-        raise ValueError(f"No records found in {input_fasta}")
-
-    ref_header, ref_seq = records[0]
-    records[0] = (ref_header, normalize_sequence(ref_seq))
-    write_fasta_records(records, output_fasta)
-
 
 def run_hypermut_once(
     cfg: PipelineConfig,
@@ -391,10 +379,6 @@ def run_hypermut_once(
 ) -> dict[str, str]:
     prefix = str(seq_output_dir / f"{run_cfg.name}-{direction_tag}-")
     run_input_fasta = aligned_pair_fasta
-
-    if run_cfg.match == "partial":
-        run_input_fasta = seq_output_dir / f"{run_cfg.name}-{direction_tag}-input-sanitized.fasta"
-        sanitize_reference_for_partial(aligned_pair_fasta, run_input_fasta)
 
     cmd = [
         cfg.python_executable,
@@ -439,6 +423,7 @@ def run_hypermut_once(
         "keepgaps": str(run_cfg.keepgaps),
         "mutation_from": mutation_from,
         "mutation_to": mutation_to,
+        "input_fasta": str(run_input_fasta),
         "summary_csv": str(summary_csv),
         "positions_csv": str(positions_csv),
         "args_csv": str(args_csv),
@@ -617,6 +602,8 @@ def build_merged_row(
     run_info: dict[str, str],
     sum_row: dict[str, str],
     hxb2_p_value: str = "",
+    fasta_input_local: str = "",
+    fasta_input_hxb2: str = "",
 ) -> dict[str, str]:
     con_trimmed, que_trimmed = _strip_flanking_gaps(consensus_seq, query_seq)
     mutation_counts = count_monomer_mutations(con_trimmed, que_trimmed)
@@ -632,7 +619,9 @@ def build_merged_row(
         "match_mode": run_info["match"],
         "keepgaps": run_info["keepgaps"],
         "hypermut_p_value_local": sum_row["fisher_p"],
+        "fasta_input_local": fasta_input_local,
         "hypermut_p_value_hxb2": hxb2_p_value,
+        "fasta_input_hxb2": fasta_input_hxb2,
         "rate_ratio": sum_row["rate_ratio"],
         "primary_matches": sum_row["primary_matches"],
         "potential_primaries": sum_row["potential_primaries"],
@@ -699,7 +688,7 @@ def process_existing_pair_task(
         }
 
     try:
-        hxb2_p_values: dict[tuple[str, str, str], str] = {}
+        hxb2_info: dict[tuple[str, str, str], tuple[str, str]] = {}
         if hxb2_seq and pair_input_hxb2_dir and pair_aligned_hxb2_dir:
             hxb2_start_str = lanl_fields.get("HXB2/MAC239 start", "").strip()
             hxb2_stop_str = lanl_fields.get("HXB2/MAC239 stop", "").strip()
@@ -743,7 +732,9 @@ def process_existing_pair_task(
                                 direction_tag=f"hxb2_{direction_tag}",
                             )
                             hxb2_sum = read_single_hypermut_summary(Path(hxb2_run_info["summary_csv"]))
-                            hxb2_p_values[(mutation_from, mutation_to, mode.name)] = hxb2_sum["fisher_p"]
+                            hxb2_info[(mutation_from, mutation_to, mode.name)] = (
+                                hxb2_sum["fisher_p"], hxb2_run_info["input_fasta"]
+                            )
                 except Exception as exc:
                     LOGGER.warning("HXB2 Hypermut3 failed for %s: %s", seq_header, exc)
 
@@ -760,7 +751,7 @@ def process_existing_pair_task(
                     direction_tag=direction_tag,
                 )
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
-                hxb2_p = hxb2_p_values.get((mutation_from, mutation_to, mode.name), "")
+                hxb2_p, hxb2_fasta = hxb2_info.get((mutation_from, mutation_to, mode.name), ("", ""))
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
@@ -770,6 +761,8 @@ def process_existing_pair_task(
                         run_info=run_info,
                         sum_row=sum_row,
                         hxb2_p_value=hxb2_p,
+                        fasta_input_local=run_info["input_fasta"],
+                        fasta_input_hxb2=hxb2_fasta,
                     )
                 )
     except Exception as exc:
@@ -840,7 +833,7 @@ def process_sequence_task(
                 "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
             }
 
-        hxb2_p_values: dict[tuple[str, str, str], str] = {}
+        hxb2_info: dict[tuple[str, str, str], tuple[str, str]] = {}
         if hxb2_seq and pair_input_hxb2_dir and pair_aligned_hxb2_dir:
             hxb2_start_str = lanl_fields.get("HXB2/MAC239 start", "").strip()
             hxb2_stop_str = lanl_fields.get("HXB2/MAC239 stop", "").strip()
@@ -884,7 +877,9 @@ def process_sequence_task(
                                 direction_tag=f"hxb2_{direction_tag}",
                             )
                             hxb2_sum = read_single_hypermut_summary(Path(hxb2_run_info["summary_csv"]))
-                            hxb2_p_values[(mutation_from, mutation_to, mode.name)] = hxb2_sum["fisher_p"]
+                            hxb2_info[(mutation_from, mutation_to, mode.name)] = (
+                                hxb2_sum["fisher_p"], hxb2_run_info["input_fasta"]
+                            )
                 except Exception as exc:
                     LOGGER.warning("HXB2 Hypermut3 failed for %s: %s", seq_header, exc)
 
@@ -901,7 +896,7 @@ def process_sequence_task(
                     direction_tag=direction_tag,
                 )
                 sum_row = read_single_hypermut_summary(Path(run_info["summary_csv"]))
-                hxb2_p = hxb2_p_values.get((mutation_from, mutation_to, mode.name), "")
+                hxb2_p, hxb2_fasta = hxb2_info.get((mutation_from, mutation_to, mode.name), ("", ""))
                 rows.append(
                     build_merged_row(
                         lanl_fields=lanl_fields,
@@ -911,6 +906,8 @@ def process_sequence_task(
                         run_info=run_info,
                         sum_row=sum_row,
                         hxb2_p_value=hxb2_p,
+                        fasta_input_local=run_info["input_fasta"],
+                        fasta_input_hxb2=hxb2_fasta,
                     )
                 )
     except Exception as exc:
@@ -1054,7 +1051,8 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
         + ["consensus_header"]
         + MONOMER_MUTATION_COLUMNS
         + ["mutation_from", "mutation_to", "match_mode", "keepgaps"]
-        + ["hypermut_p_value_local", "hypermut_p_value_hxb2",
+        + ["hypermut_p_value_local", "fasta_input_local",
+           "hypermut_p_value_hxb2", "fasta_input_hxb2",
            "rate_ratio", "primary_matches",
            "potential_primaries", "control_matches", "potential_controls"]
     )
