@@ -58,6 +58,7 @@ class PipelineConfig:
     full_run: bool = False
     problematic_only: bool = False
     skip_qc: bool = False
+    raw_fasta_path: Path | None = None
 
 
 def configure_logging(log_level: str) -> None:
@@ -651,6 +652,7 @@ def process_existing_pair_task(
     hxb2_seq: str = "",
     pair_input_hxb2_dir: Path | None = None,
     pair_aligned_hxb2_dir: Path | None = None,
+    raw_seq_map: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str] | None]:
     rows: list[dict[str, str]] = []
     pair_records = read_fasta_records(pair_aligned)
@@ -720,7 +722,8 @@ def process_existing_pair_task(
                 hxb2_run_dir = seq_run_dir / "hxb2"
                 hxb2_run_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    query_body = query_seq.replace("-", "")
+                    accession = lanl_fields.get("Accession", "").strip()
+                    query_body = (raw_seq_map.get(accession) if raw_seq_map and accession else None) or query_seq.replace("-", "")
                     aligned_hxb2 = align_pair_with_mafft(
                         consensus_header=hxb2_header,
                         consensus_seq=hxb2_region,
@@ -806,6 +809,7 @@ def process_sequence_task(
     hxb2_seq: str = "",
     pair_input_hxb2_dir: Path | None = None,
     pair_aligned_hxb2_dir: Path | None = None,
+    raw_seq_map: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, str] | None]:
     rows: list[dict[str, str]] = []
     seq_slug = f"{idx:04d}_{sanitize_file_component(seq_header)}"
@@ -870,7 +874,8 @@ def process_sequence_task(
                 hxb2_run_dir = seq_run_dir / "hxb2"
                 hxb2_run_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    query_body = seq_body.replace("-", "")
+                    accession = lanl_fields.get("Accession", "").strip()
+                    query_body = (raw_seq_map.get(accession) if raw_seq_map and accession else None) or seq_body.replace("-", "")
                     aligned_hxb2 = align_pair_with_mafft(
                         consensus_header=hxb2_header,
                         consensus_seq=hxb2_region,
@@ -973,6 +978,17 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
             LOGGER.warning("HXB2 FASTA is empty: %s", cfg.hxb2_reference_fasta)
     else:
         LOGGER.warning("HXB2 reference not provided or not found — skipping HXB2 p-values")
+
+    raw_seq_map: dict[str, str] = {}
+    if cfg.raw_fasta_path and cfg.raw_fasta_path.exists():
+        for header, seq in read_fasta_records(cfg.raw_fasta_path):
+            fields = _parse_lanl_header(header)
+            accession = fields.get("Accession", "").strip()
+            if accession:
+                raw_seq_map[accession] = normalize_sequence(seq)
+        LOGGER.info("Loaded %d raw sequences from %s", len(raw_seq_map), cfg.raw_fasta_path)
+    else:
+        LOGGER.warning("Raw FASTA not provided or not found — HXB2 alignment will use grouped sequences")
 
     merged_csv = cfg.output_dir / "per_sequence_hypermut_merged.csv"
     live_progress_csv = (
@@ -1138,6 +1154,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     hxb2_seq=hxb2_seq,
                     pair_input_hxb2_dir=pair_input_hxb2_dir,
                     pair_aligned_hxb2_dir=pair_aligned_hxb2_dir,
+                    raw_seq_map=raw_seq_map,
                 )
                 for pair_aligned in aligned_files
             ]
@@ -1233,6 +1250,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, str | int]:
                     hxb2_seq=hxb2_seq,
                     pair_input_hxb2_dir=pair_input_hxb2_dir,
                     pair_aligned_hxb2_dir=pair_aligned_hxb2_dir,
+                    raw_seq_map=raw_seq_map,
                 )
                 for idx, seq_header, final_key, seq_body, consensus_header, consensus_seq in valid_tasks
             ]
@@ -1364,6 +1382,16 @@ def parse_args() -> argparse.Namespace:
             "Default is false (QC failures skip Hypermut3)."
         ),
     )
+    parser.add_argument(
+        "--raw-fasta",
+        type=Path,
+        default=None,
+        help=(
+            "Path to raw unaligned FASTA file for HXB2 pairwise alignment. "
+            "Sequences are matched by Accession field. "
+            "Default: data/hiv-db-any-unaligned.fasta"
+        ),
+    )
     args = parser.parse_args()
     if args.number_of_sequence is not None and args.number_of_sequence <= 0:
         parser.error("--number-of-sequence must be a positive integer")
@@ -1415,6 +1443,7 @@ def main() -> None:
         full_run=args.full_run,
         problematic_only=args.problematic_only,
         skip_qc=args.skip_qc,
+        raw_fasta_path=args.raw_fasta or (project_root / "data" / "hiv-db-any-unaligned.fasta"),
     )
 
     configure_logging(cfg.log_level)
@@ -1445,4 +1474,7 @@ if __name__ == "__main__":
 #     --parallel-workers N                            Number of parallel workers
 #     --reuse-existing-pairwise-alignments true       Reuse existing pairwise FASTA
 #     --hxb2-reference path/to/hxb2.fasta             Custom HXB2 reference
+#     --skip-qc true                                  Skip alignment QC, run Hypermut3 regardless
+#     --raw-fasta path/to/raw.fasta                   Raw FASTA for HXB2 pairwise alignment
+#                                                     (default: data/hiv-db-any-unaligned.fasta)
 # ──────────────────────────────────────────────────────────────
