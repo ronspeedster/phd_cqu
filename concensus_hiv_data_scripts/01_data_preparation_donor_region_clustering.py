@@ -557,43 +557,41 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
                         )
                     )
 
-    # CROSS-DONOR MERGE: collect undersized groups and re-cluster by region
-    valid_bins = []
-    undersized_records: list[SequenceRecord] = []
+    # SINGLETON POOLING: collect undersized groups, re-cluster by region
+    good_bins = []
+    singleton_records: list[SequenceRecord] = []
     for entry in final_bins:
         _donor, _rid, _bid, group_recs, _src = entry
         if len(group_recs) < cfg.min_bin_size:
-            undersized_records.extend(group_recs)
+            singleton_records.extend(group_recs)
         else:
-            valid_bins.append(entry)
+            good_bins.append(entry)
 
-    if undersized_records:
+    if singleton_records:
         LOGGER.info(
-            "Cross-donor merge: %d undersized sequences from %d groups, re-clustering by region",
-            len(undersized_records),
-            len(final_bins) - len(valid_bins),
+            "Singleton pooling: %d sequences from undersized groups, re-clustering by region",
+            len(singleton_records),
         )
         cross_valid, cross_missing = cluster_by_region(
-            undersized_records, buffer=cfg.coordinate_buffer
+            singleton_records, buffer=cfg.coordinate_buffer
         )
         cross_all = cross_valid + cross_missing
-        cross_merged = merge_small_region_clusters(cross_all, cfg.min_bin_size)
 
-        for region_idx, (cluster_records, _cs, _ce) in enumerate(cross_merged, start=1):
+        for region_idx, (cluster_records, _cs, _ce) in enumerate(cross_all, start=1):
             chunked_bins = split_cluster_to_bins(cluster_records, cfg.max_bin_size, cfg.min_bin_size)
             for bin_idx, bin_records in enumerate(chunked_bins, start=1):
+                final_key = f"Donor=CROSSREGION|RegionId={region_idx}|BinId={bin_idx}"
                 for rec in bin_records:
-                    seq_to_final_key[rec.header] = f"Donor=CROSSDONOR|RegionId={region_idx}|BinId={bin_idx}"
-                valid_bins.append(
-                    (None, region_idx, bin_idx, bin_records, "Donor=CROSSDONOR")
+                    seq_to_final_key[rec.header] = final_key
+                good_bins.append(
+                    (None, region_idx, bin_idx, bin_records, "Donor=CROSSREGION")
                 )
 
         LOGGER.info(
-            "Cross-donor merge complete: %d final groups (%d undersized sequences absorbed)",
-            len(valid_bins),
-            len(undersized_records),
+            "Singleton pooling complete: %d final groups total",
+            len(good_bins),
         )
-    final_bins = valid_bins
+    final_bins = good_bins
 
     LOGGER.info(
         "Proceeding with %d final bins from %d sequences",
@@ -609,7 +607,7 @@ def run_grouped_pipeline(cfg: GroupedConfig) -> dict[str, str | int]:
 
     for group_index, (donor, region_id, bin_id, group_records, source_key) in enumerate(final_bins, start=1):
         group_size = len(group_records)
-        donor_text = "CROSSDONOR" if source_key == "Donor=CROSSDONOR" else (str(donor) if donor is not None else "UNKNOWN")
+        donor_text = "CROSSREGION" if source_key == "Donor=CROSSREGION" else (str(donor) if donor is not None else "UNKNOWN")
 
         group_tag = f"group_{group_index:03d}"
         final_group_key = f"Donor={donor_text}|RegionId={region_id}|BinId={bin_id}"

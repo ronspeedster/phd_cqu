@@ -57,6 +57,7 @@ class PipelineConfig:
     log_level: str = "INFO"
     full_run: bool = False
     problematic_only: bool = False
+    skip_qc: bool = False
 
 
 def configure_logging(log_level: str) -> None:
@@ -683,7 +684,7 @@ def process_existing_pair_task(
     )
 
     qc = validate_alignment_quality(consensus_seq, query_seq)
-    if not qc.passed:
+    if not qc.passed and not cfg.skip_qc:
         LOGGER.warning(
             "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — skipping Hypermut3",
             seq_header, qc.identity, qc.gap_fraction_query,
@@ -693,6 +694,11 @@ def process_existing_pair_task(
             "final_group_key": final_key,
             "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
         }
+    elif not qc.passed and cfg.skip_qc:
+        LOGGER.warning(
+            "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — but skip_qc=True, continuing anyway",
+            seq_header, qc.identity, qc.gap_fraction_query,
+        )
 
     try:
         hxb2_info: dict[tuple[str, str, str], tuple[str, str]] = {}
@@ -829,7 +835,7 @@ def process_sequence_task(
         aligned_query_seq = aligned_pair[1][1]
 
         qc = validate_alignment_quality(aligned_consensus_seq, aligned_query_seq)
-        if not qc.passed:
+        if not qc.passed and not cfg.skip_qc:
             LOGGER.warning(
                 "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — skipping Hypermut3",
                 seq_header, qc.identity, qc.gap_fraction_query,
@@ -839,6 +845,11 @@ def process_sequence_task(
                 "final_group_key": final_key,
                 "error": f"Alignment QC failed: identity={qc.identity:.3f}, gap_frac={qc.gap_fraction_query:.3f}",
             }
+        elif not qc.passed and cfg.skip_qc:
+            LOGGER.warning(
+                "QC FAILED for %s: identity=%.3f, gap_frac=%.3f — but skip_qc=True, continuing anyway",
+                seq_header, qc.identity, qc.gap_fraction_query,
+            )
 
         hxb2_info: dict[tuple[str, str, str], tuple[str, str]] = {}
         if hxb2_seq and pair_input_hxb2_dir and pair_aligned_hxb2_dir:
@@ -1344,6 +1355,15 @@ def parse_args() -> argparse.Namespace:
             "Default is false (process all sequences)."
         ),
     )
+    parser.add_argument(
+        "--skip-qc",
+        type=parse_bool,
+        default=False,
+        help=(
+            "Skip alignment quality checks and run Hypermut3 regardless. "
+            "Default is false (QC failures skip Hypermut3)."
+        ),
+    )
     args = parser.parse_args()
     if args.number_of_sequence is not None and args.number_of_sequence <= 0:
         parser.error("--number-of-sequence must be a positive integer")
@@ -1394,6 +1414,7 @@ def main() -> None:
         log_level="INFO",
         full_run=args.full_run,
         problematic_only=args.problematic_only,
+        skip_qc=args.skip_qc,
     )
 
     configure_logging(cfg.log_level)
